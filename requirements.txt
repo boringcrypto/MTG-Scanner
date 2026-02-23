@@ -1,0 +1,22 @@
+# Core ML
+# torch and torchvision must be installed separately with the correct CUDA variant:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.10.0
+torchvision>=0.25.0
+ultralytics==8.4.14
+
+# Vision / data
+opencv-python>=4.13
+numpy>=2.2
+Pillow>=12.0
+lmdb>=1.7
+scipy>=1.15
+
+# Training utilities
+tensorboard>=2.20
+tqdm>=4.67
+codetiming>=1.4
+PyYAML>=6.0
+
+# Web demo
+Flask>=3.1

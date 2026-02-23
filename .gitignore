@@ -1,0 +1,43 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ── YOLO / PyTorch model weights ──────────────────────────────────────────────
+*.pt
+*.onnx
+*.engine
+*.tflite
+
+# ── Training runs (large, fully reproducible) ─────────────────────────────────
+runs/
+
+# ── Generated datasets ────────────────────────────────────────────────────────
+dataset/
+cards/
+
+# ── LMDB databases ────────────────────────────────────────────────────────────
+*.lmdb/
+backgrounds.lmdb/
+cards.lmdb/
+
+# ── Cache / index files ───────────────────────────────────────────────────────
+*_cache.json
+*_index.json
+mtg_cache.json
+*.cache
+
+# ── Extracted source data ─────────────────────────────────────────────────────
+_dtd_extract/
+
+# ── Temp dataset yamls written by train.py --stream ───────────────────────────
+stream_dataset_*.yaml
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MTG Card Detector</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: monospace;
+           display: flex; flex-direction: column; align-items: center;
+           gap: 0.75rem; padding: 1rem; }
+    h1 { font-size: 1.2rem; color: #0f0; }
+    #status { font-size: 0.8rem; color: #888; min-height: 1.2em; }
+
+    /* ── Live feed (small) ── */
+    #feed-wrap { position: relative; display: inline-block; }
+    #video  { display: block; width: 240px; height: 180px; background: #000; }
+    #feed-label { font-size: 0.7rem; color: #555; text-align: center; margin-top: 2px; }
+
+    /* ── Annotated snapshot (big) ── */
+    #snap-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    #snap { display: block; max-width: min(800px, 95vw); border: 1px solid #333;
+            background: #000; image-rendering: auto; }
+    #snap-label { font-size: 0.7rem; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>MTG Card Corner Detector</h1>
+  <div id="model-path" style="font-size:0.65rem;color:#444;max-width:95vw;word-break:break-all;">model: …</div>
+  <div id="status">Starting camera…</div>
+
+  <div id="feed-wrap">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+  <div id="feed-label">live feed</div>
+
+  <div id="snap-wrap">
+    <img id="snap" alt="last detection" />
+    <div id="snap-label">last scanned frame</div>
+  </div>
+
+<script>
+const video  = document.getElementById("video");
+const snap   = document.getElementById("snap");
+const status = document.getElementById("status");
+
+const CAPTURE_W = 640;
+const CAPTURE_H = 480;
+const FPS       = 15;
+const CONF_MIN  = 0.4;
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: CAPTURE_W, height: CAPTURE_H, facingMode: "environment" }
+    });
+    video.srcObject = stream;
+    video.onloadedmetadata = () => {
+      status.textContent = "Camera ready — detecting…";
+      scheduleFrame();
+    };
+  } catch (e) {
+    status.textContent = "Camera error: " + e.message;
+  }
+}
+
+const capture = document.createElement("canvas");
+const capCtx  = capture.getContext("2d");
+let   busy    = false;
+
+function scheduleFrame() {
+  setTimeout(sendFrame, 1000 / FPS);
+}
+
+async function sendFrame() {
+  if (busy) { scheduleFrame(); return; }
+  busy = true;
+
+  capture.width  = video.videoWidth  || CAPTURE_W;
+  capture.height = video.videoHeight || CAPTURE_H;
+  capCtx.drawImage(video, 0, 0);
+
+  capture.toBlob(async (blob) => {
+    try {
+      const resp = await fetch("/detect", {
+        method: "POST",
+        headers: { "Content-Type": "image/jpeg" },
+        body: blob
+      });
+      const data = await resp.json();
+      const dets = (data.detections || []).filter(d => d.conf >= CONF_MIN);
+
+      // Always update the annotated snapshot
+      if (data.annotated) {
+        snap.src = "data:image/jpeg;base64," + data.annotated;
+      }
+
+      const n = dets.length;
+      const corners = ["TL","TR","BR","BL"];
+      status.textContent = n > 0
+        ? dets.map(d =>
+            `${(d.conf*100).toFixed(0)}% — ` +
+            corners.map((lbl,i) => `${lbl}:(${d.corners[i][0].toFixed(3)},${d.corners[i][1].toFixed(3)})`).join(" ")
+          ).join(" | ")
+        : "No cards detected";
+    } catch (e) {
+      status.textContent = "Server error: " + e.message;
+    } finally {
+      busy = false;
+      scheduleFrame();
+    }
+  }, "image/jpeg", 0.85);
+}
+
+startCamera();
+
+fetch("/model").then(r => r.json()).then(d => {
+  document.getElementById("model-path").textContent = "model: " + d.path;
+});
+</script>
+</body>
+</html>
