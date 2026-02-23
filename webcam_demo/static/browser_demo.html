@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MTG Card Detector — Browser</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: monospace;
+           display: flex; flex-direction: column; align-items: center;
+           gap: 0.75rem; padding: 1rem; }
+    h1 { font-size: 1.2rem; color: #0f0; }
+    #status  { font-size: 0.8rem; color: #888; min-height: 1.2em; }
+    #dbg     { font-size: 0.65rem; color: #444; }
+
+    /* annotated canvas */
+    #out-wrap { position: relative; }
+    #out { display: block; max-width: min(800px, 95vw);
+           border: 1px solid #333; background: #000; }
+
+    /* hidden plumbing */
+    #video { display: none; }
+    #preprocess { display: none; }
+    #snapshot { display: none; }
+  </style>
+</head>
+<body>
+  <h1>MTG Card Corner Detector — Browser (ONNX)</h1>
+  <div id="status">Loading model…</div>
+  <div id="dbg"></div>
+
+  <canvas id="out"></canvas>
+
+  <!-- hidden plumbing -->
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="preprocess"></canvas><!-- 640×640 letterbox for model input -->
+  <canvas id="snapshot"></canvas><!-- frame captured before inference -->
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+<script>
+"use strict";
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const MODEL_URL  = "model.onnx";   // served from same /static/ folder via Flask
+const IMGSZ      = 640;
+const CONF_MIN   = 0.40;
+const TARGET_FPS = 15;
+
+// Corner colours: TL=red TR=yellow BR=blue BL=white
+const CORNER_COLORS = ["#ff3333", "#ffff00", "#3399ff", "#ffffff"];
+const CORNER_LABELS = ["TL", "TR", "BR", "BL"];
+
+// ── Elements ──────────────────────────────────────────────────────────────────
+const video  = document.getElementById("video");
+const prepCv = document.getElementById("preprocess");
+const prepCtx = prepCv.getContext("2d");
+const outCv  = document.getElementById("out");
+const outCtx = outCv.getContext("2d");
+const snapCv  = document.getElementById("snapshot");
+const snapCtx = snapCv.getContext("2d");
+const status = document.getElementById("status");
+const dbg    = document.getElementById("dbg");
+
+prepCv.width  = IMGSZ;
+prepCv.height = IMGSZ;
+
+// ── Load ONNX model ───────────────────────────────────────────────────────────
+let session = null;
+let inputName = null;
+let outputShape = null;   // [1, features, anchors]
+
+(async () => {
+  try {
+    // Use WASM backend (works everywhere); enable WebGL with:
+    // ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/";
+    ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+
+    status.textContent = "Loading model… (first load may be slow)";
+    session = await ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: ["webgl", "wasm"],  // fall back to wasm if webgl unavailable
+    });
+
+    inputName = session.inputNames[0];
+    // Probe output shape with a dummy run
+    const dummy = new ort.Tensor("float32", new Float32Array(3 * IMGSZ * IMGSZ), [1, 3, IMGSZ, IMGSZ]);
+    const probeOut = await session.run({ [inputName]: dummy });
+    const outName  = session.outputNames[0];
+    outputShape = probeOut[outName].dims;  // e.g. [1, 17, 8400]
+    dbg.textContent = `input: ${inputName} [1,3,${IMGSZ},${IMGSZ}] | output: ${outName} [${outputShape}]`;
+    status.textContent = "Model ready — starting camera…";
+
+    await startCamera();
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+    console.error(e);
+  }
+})();
+
+// ── Camera ─────────────────────────────────────────────────────────────────────
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
+  });
+  video.srcObject = stream;
+  await new Promise(res => { video.onloadedmetadata = res; });
+  await video.play();
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cropSize = Math.min(vw, vh);
+  outCv.width   = cropSize;
+  outCv.height  = cropSize;
+  outCv.style.maxWidth = "min(800px, 95vw)";
+  snapCv.width  = cropSize;
+  snapCv.height = cropSize;
+
+  status.textContent = `Camera: ${vw}×${vh} — detecting…`;
+  scheduleFrame();
+}
+
+// ── Inference loop ─────────────────────────────────────────────────────────────
+let busy = false;
+
+function scheduleFrame() {
+  setTimeout(runFrame, 1000 / TARGET_FPS);
+}
+
+async function runFrame() {
+  if (busy || !session) { scheduleFrame(); return; }
+  busy = true;
+  const t0 = performance.now();
+
+  try {
+    const vw = video.videoWidth, vh = video.videoHeight;
+
+    // ── 1. Centre-crop to square, resize to IMGSZ×IMGSZ ──────────────────
+    const cropSize = Math.min(vw, vh);
+    const cropX    = Math.round((vw - cropSize) / 2);
+    const cropY    = Math.round((vh - cropSize) / 2);
+    const scale    = IMGSZ / cropSize;
+
+    // Capture this exact frame for display — must happen before any await
+    snapCtx.drawImage(video,
+      cropX, cropY, cropSize, cropSize,  // source: centred square
+      0, 0, cropSize, cropSize           // dest: fill snapCv exactly
+    );
+
+    prepCtx.drawImage(video,
+      cropX, cropY, cropSize, cropSize,  // source: centred square
+      0, 0, IMGSZ, IMGSZ                 // dest: full 640×640
+    );
+
+    const imgData  = prepCtx.getImageData(0, 0, IMGSZ, IMGSZ);
+    const pixels   = imgData.data;               // RGBA, uint8
+    const n        = IMGSZ * IMGSZ;
+    const inputBuf = new Float32Array(3 * n);    // CHW, RGB, [0,1]
+    for (let i = 0; i < n; i++) {
+      inputBuf[i]         = pixels[i * 4]     / 255.0;  // R
+      inputBuf[n + i]     = pixels[i * 4 + 1] / 255.0;  // G
+      inputBuf[2 * n + i] = pixels[i * 4 + 2] / 255.0;  // B
+    }
+
+    // ── 2. Run inference ───────────────────────────────────────────────────
+    const tensor = new ort.Tensor("float32", inputBuf, [1, 3, IMGSZ, IMGSZ]);
+    const result = await session.run({ [inputName]: tensor });
+    const rawOut = result[session.outputNames[0]];    // Float32Array
+    const data   = rawOut.data;                       // Float32Array (flat)
+    const dims   = rawOut.dims;                       // [1, features, anchors]
+
+    // ── 3. Parse detections ────────────────────────────────────────────────
+    // dims = [1, N, F]  N = max detections (300), F = 18 (already NMS-applied)
+    // F layout: x1 y1 x2 y2 | conf | cls | kx0 ky0 kv0 | kx1 ky1 kv1 | ...
+    const N = dims[1];   // max detections
+    const F = dims[2];   // features per detection (18)
+    const nKpts = (F - 6) / 3;  // (18-6)/3 = 4
+    const detections = [];
+
+    for (let i = 0; i < N; i++) {
+      const base = i * F;
+      const conf = data[base + 4];
+      if (conf < CONF_MIN) continue;
+
+      // Box is xyxy in model pixel space — convert to cx/cy/w/h for reference
+      const x1 = data[base + 0], y1 = data[base + 1];
+      const x2 = data[base + 2], y2 = data[base + 3];
+
+      // Keypoints x,y in model pixel space → map back through crop+scale
+      const kpts = [];
+      for (let k = 0; k < nKpts; k++) {
+        const kx = data[base + 6 + k * 3];
+        const ky = data[base + 6 + k * 3 + 1];
+        // Invert scale only — coords are in crop-canvas space (origin = top-left of crop)
+        kpts.push([
+          kx / scale,
+          ky / scale,
+        ]);
+      }
+      detections.push({ x1, y1, x2, y2, conf, kpts });
+    }
+
+    // ── 4. Draw to output canvas (use the pre-inference snapshot, not live video)
+    outCtx.drawImage(snapCv, 0, 0);
+
+    for (const det of detections) {
+      const { conf, kpts } = det;
+      if (kpts.length < 4) continue;
+
+      // Card outline
+      outCtx.strokeStyle = "#00ff00";
+      outCtx.lineWidth   = 2;
+      outCtx.beginPath();
+      outCtx.moveTo(kpts[0][0], kpts[0][1]);
+      for (let k = 1; k < 4; k++) outCtx.lineTo(kpts[k][0], kpts[k][1]);
+      outCtx.closePath();
+      outCtx.stroke();
+
+      // Corners
+      for (let k = 0; k < 4; k++) {
+        const [kx, ky] = kpts[k];
+        const col = CORNER_COLORS[k];
+        const lbl = CORNER_LABELS[k];
+
+        outCtx.fillStyle = col;
+        outCtx.beginPath();
+        outCtx.arc(kx, ky, 7, 0, Math.PI * 2);
+        outCtx.fill();
+
+        outCtx.fillStyle = col;
+        outCtx.font = "bold 13px monospace";
+        outCtx.fillText(lbl, kx + 9, ky - 6);
+      }
+
+      // Confidence near TL corner
+      const [tlx, tly] = kpts[0];
+      outCtx.fillStyle = "#00ff00";
+      outCtx.font = "bold 14px monospace";
+      outCtx.fillText(`${(conf * 100).toFixed(0)}%`, tlx, tly - 12);
+    }
+
+    const ms = (performance.now() - t0).toFixed(0);
+    const n2 = detections.length;
+    status.textContent = n2 > 0
+      ? detections.map(d => {
+          const cs = d.kpts.map((p, i) =>
+            `${CORNER_LABELS[i]}:(${p[0].toFixed(0)},${p[1].toFixed(0)})`).join(" ");
+          return `${(d.conf*100).toFixed(0)}% — ${cs}`;
+        }).join(" | ") + `  [${ms}ms]`
+      : `No cards detected  [${ms}ms]`;
+
+  } catch (e) {
+    status.textContent = "Inference error: " + e.message;
+    console.error(e);
+  } finally {
+    busy = false;
+    scheduleFrame();
+  }
+}
+</script>
+</body>
+</html>

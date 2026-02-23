@@ -29,8 +29,25 @@ MAX_HEIGHT = 640
 DEFAULT_SRC = "C:\\card_images"
 DEFAULT_OUT = "cards.lmdb"
 JPEG_QUALITY = 75
-# LMDB map size: 20 GB — sparse on NTFS/ext4, only used space is allocated
-LMDB_MAP_SIZE = 20 * 1024 ** 3
+LMDB_INIT_SIZE = 250 * 1024 ** 2   # start at 250 MB
+LMDB_GROW_SIZE = 250 * 1024 ** 2   # grow by 250 MB whenever the db is full
+
+
+def _put_batch(out_path: str, env_holder: list, batch: dict) -> None:
+    """Write *batch* to LMDB, auto-growing by LMDB_GROW_SIZE on MapFullError."""
+    for attempt in range(1, 10):
+        try:
+            with env_holder[0].begin(write=True) as txn:
+                for k, v in batch.items():
+                    txn.put(k, v)
+            return
+        except lmdb.MapFullError:
+            cur = env_holder[0].info()["map_size"]
+            new = cur + LMDB_GROW_SIZE
+            print(f"\nLMDB full at {cur // 1024**2} MB — growing to {new // 1024**2} MB (attempt {attempt})")
+            env_holder[0].close()
+            env_holder[0] = lmdb.open(out_path, map_size=new)
+    raise RuntimeError("LMDB growth did not resolve MapFullError after 1000 attempts — disk may be full")
 
 
 def encode(src_path: Path, max_height: int):
@@ -66,7 +83,7 @@ def main():
         return encode(src_path, args.height)
 
     BATCH = 500
-    env = lmdb.open(args.out, map_size=LMDB_MAP_SIZE)
+    env_holder = [lmdb.open(args.out, map_size=LMDB_INIT_SIZE)]
     idx = 0
     batch = {}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -76,19 +93,14 @@ def main():
             batch[str(idx).encode()] = data
             idx += 1
             if len(batch) >= BATCH:
-                with env.begin(write=True) as txn:
-                    for k, v in batch.items():
-                        txn.put(k, v)
+                _put_batch(args.out, env_holder, batch)
                 batch.clear()
 
     if batch:
-        with env.begin(write=True) as txn:
-            for k, v in batch.items():
-                txn.put(k, v)
+        _put_batch(args.out, env_holder, batch)
 
-    with env.begin(write=True) as txn:
-        txn.put(b"__len__", str(idx).encode())
-    env.close()
+    _put_batch(args.out, env_holder, {b"__len__": str(idx).encode()})
+    env_holder[0].close()
 
     print(f"Done — {idx} cards written to {args.out}")
 

@@ -37,7 +37,8 @@ from tqdm import tqdm
 WORK_DIR        = Path(__file__).parent
 LMDB_PATH       = WORK_DIR / "backgrounds.lmdb"
 INDEX_FILE      = WORK_DIR / "backgrounds_index.json"
-LMDB_MAP_SIZE   = 20 * 1024 ** 3   # 20 GB sparse
+LMDB_INIT_SIZE  = 250 * 1024 ** 2   # start at 250 MB
+LMDB_GROW_SIZE  = 250 * 1024 ** 2   # grow by 250 MB whenever the db is full
 JPEG_QUALITY    = 75
 TARGET_SHORT    = 640               # short side target; long side ≥ 640 → crop room
 REQUEST_TIMEOUT = 30
@@ -50,8 +51,8 @@ BATCH           = 200               # LMDB write batch size
 # LMDB + index helpers
 # ---------------------------------------------------------------------------
 
-def _open_lmdb(write: bool = False):
-    return lmdb.open(str(LMDB_PATH), map_size=LMDB_MAP_SIZE,
+def _open_lmdb(write: bool = False, map_size: int = LMDB_INIT_SIZE):
+    return lmdb.open(str(LMDB_PATH), map_size=map_size,
                      readonly=not write, lock=write,
                      readahead=False, meminit=False)
 
@@ -95,7 +96,8 @@ class _LmdbWriter:
 
     def __init__(self, index: dict):
         self.index = index
-        self.env   = _open_lmdb(write=True)
+        self._map_size = LMDB_INIT_SIZE
+        self.env   = _open_lmdb(write=True, map_size=self._map_size)
         self.batch: dict[bytes, bytes] = {}
         self._start_count = index["count"]
 
@@ -109,10 +111,19 @@ class _LmdbWriter:
     def _flush(self) -> None:
         if not self.batch:
             return
-        with self.env.begin(write=True) as txn:
-            for k, v in self.batch.items():
-                txn.put(k, v)
-        self.batch.clear()
+        for attempt in range(1, 1001):
+            try:
+                with self.env.begin(write=True) as txn:
+                    for k, v in self.batch.items():
+                        txn.put(k, v)
+                self.batch.clear()
+                return
+            except lmdb.MapFullError:
+                self._map_size += LMDB_GROW_SIZE
+                print(f"\nLMDB full — growing to {self._map_size // 1024**2} MB (attempt {attempt})")
+                self.env.close()
+                self.env = _open_lmdb(write=True, map_size=self._map_size)
+        raise RuntimeError("LMDB growth did not resolve MapFullError after 1000 attempts — disk may be full")
 
     def close(self) -> int:
         self._flush()
