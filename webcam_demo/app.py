@@ -20,19 +20,23 @@ from pathlib import Path
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 def _find_latest_model():
-    """Find last.pt from the highest-numbered training run under runs/."""
-    import re
-    root = Path(__file__).parent.parent / "runs"
-    best_num  = -1
-    best_path = None
-    for weights in root.rglob("last.pt"):
-        run_dir = weights.parent.parent          # e.g. runs/pose/train6
-        m = re.search(r'(\d+)$', run_dir.name)  # extract trailing number
-        num = int(m.group(1)) if m else 0
-        if num > best_num:
-            best_num  = num
-            best_path = weights
-    return str(best_path) if best_path else None
+    """Use last.pt in webcam_demo/ if present, otherwise find highest-numbered training run."""
+    local = Path(__file__).parent / "last.pt"
+    if local.exists():
+        return str(local)
+    # import re
+    # root = Path(__file__).parent.parent / "runs"
+    # best_num  = -1
+    # best_path = None
+    # for weights in root.rglob("last.pt"):
+    #     run_dir = weights.parent.parent
+    #     m = re.search(r'(\d+)$', run_dir.name)
+    #     num = int(m.group(1)) if m else 0
+    #     if num > best_num:
+    #         best_num  = num
+    #         best_path = weights
+    # return str(best_path) if best_path else None
+    return None  # disable auto-find for now — forces explicit --model
 
 p = argparse.ArgumentParser()
 p.add_argument("--model", default=None, help="Path to pose best.pt")

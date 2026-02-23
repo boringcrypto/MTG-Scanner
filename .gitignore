@@ -7,10 +7,7 @@ venv/
 *.egg-info/
 
 # ── YOLO / PyTorch model weights ──────────────────────────────────────────────
-*.pt
-*.onnx
-*.engine
-*.tflite
+/*.pt
 
 # ── Training runs (large, fully reproducible) ─────────────────────────────────
 runs/
@@ -41,3 +38,5 @@ stream_dataset_*.yaml
 Thumbs.db
 *.swp
 .vscode/
+
+*.zip
