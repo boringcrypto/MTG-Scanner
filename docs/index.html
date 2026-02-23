@@ -76,7 +76,7 @@ let outputShape = null;   // [1, features, anchors]
 
     status.textContent = "Loading model… (first load may be slow)";
     session = await ort.InferenceSession.create(MODEL_URL, {
-      executionProviders: ["webgl", "wasm"],  // fall back to wasm if webgl unavailable
+      executionProviders: ["webgpu", "webgl", "wasm"],  // webgpu fastest on modern phones
     });
 
     inputName = session.inputNames[0];
