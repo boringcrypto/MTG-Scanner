@@ -52,7 +52,7 @@ export_path = Path(export_path)
 print(f"Exported → {export_path}")
 
 # ── Move to desired location ──────────────────────────────────────────────────
-dest = Path(args.out) if args.out else Path("webcam_demo/static/model.onnx")
+dest = Path(args.out) if args.out else Path("docs/model.onnx")
 dest.parent.mkdir(parents=True, exist_ok=True)
 if dest != export_path:
     export_path.rename(dest)
