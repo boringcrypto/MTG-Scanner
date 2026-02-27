@@ -10,7 +10,7 @@ export default {
         <div class="card shadow-sm mb-3">
           <div class="card-body">
             <h5 class="card-title mb-4"><i class="bi bi-search me-2"></i>Card Lookup</h5>
-            <form @submit.prevent="lookup">
+            <form @submit.prevent="lookupByIdx">
               <div class="mb-3">
                 <label class="form-label">Card index</label>
                 <input v-model.number="idx" type="number" min="0" :max="cardCount ? cardCount - 1 : undefined"
@@ -21,6 +21,22 @@ export default {
                 </div>
               </div>
               <button class="btn btn-primary w-100" type="submit">
+                <i class="bi bi-arrow-right-circle me-1"></i>View Card
+              </button>
+            </form>
+          </div>
+        </div>
+
+        <div class="card shadow-sm mb-3">
+          <div class="card-body">
+            <h5 class="card-title mb-4"><i class="bi bi-upc-scan me-2"></i>Lookup by Product ID</h5>
+            <form @submit.prevent="lookupByProductId">
+              <div class="mb-3">
+                <input v-model.trim="productId" type="text"
+                       class="form-control" placeholder="e.g. 12345" required />
+                <div class="form-text text-danger" v-if="productIdError">{{ productIdError }}</div>
+              </div>
+              <button class="btn btn-secondary w-100" type="submit">
                 <i class="bi bi-arrow-right-circle me-1"></i>View Card
               </button>
             </form>
@@ -40,10 +56,28 @@ export default {
     </div>
   `,
   setup() {
-    const idx    = ref(0);
-    const router = useRouter();
+    const idx          = ref(0);
+    const productId    = ref("");
+    const productIdError = ref("");
+    const router       = useRouter();
     onMounted(fetchCount);
-    function lookup() { router.push(`/card/${idx.value}`); }
-    return { idx, cardCount, lookup };
+
+    function lookupByIdx() {
+      router.push(`/card/${idx.value}`);
+    }
+
+    async function lookupByProductId() {
+      productIdError.value = "";
+      try {
+        const res = await fetch(`/api/card/by-product-id/${encodeURIComponent(productId.value)}`);
+        if (!res.ok) { productIdError.value = `Not found: ${productId.value}`; return; }
+        const data = await res.json();
+        router.push(`/card/${data.index}`);
+      } catch (e) {
+        productIdError.value = "Request failed.";
+      }
+    }
+
+    return { idx, cardCount, lookupByIdx, productId, productIdError, lookupByProductId };
   },
 };

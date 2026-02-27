@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tqdm import tqdm
 
@@ -32,10 +34,11 @@ CARDS_224         = "data/cards/cards_224.lmdb"
 CANONICAL_INDEX   = "data/cards/canonical_index.json"
 CHECKPOINT_DIR    = "runs/recog"
 CLUSTER_SIZE      = 128        # anchor + 127 nearest neighbours
-MARGIN_SLACK     = 0.1        # added on top of current min pairwise distance
+MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
 EPOCHS            = 100
 EMBED_BATCH       = 1024       # images per no-grad forward pass
+IMG_WORKERS       = 8          # parallel image-decode threads
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -44,28 +47,46 @@ def _open_lmdb(path: str):
     return lmdb.open(path, readonly=True, lock=False, readahead=False, meminit=False)
 
 
-def _fetch_images(env, indices: list) -> np.ndarray:
+# Thread-local LMDB env cache — one persistent env per thread, avoids open/close overhead
+_tls = threading.local()
+
+def _tls_env(path: str) -> lmdb.Environment:
+    if not hasattr(_tls, 'envs'):
+        _tls.envs = {}
+    if path not in _tls.envs:
+        _tls.envs[path] = _open_lmdb(path)
+    return _tls.envs[path]
+
+
+def _decode_one(args) -> np.ndarray:
+    """Decode a single image; called from worker threads."""
+    lmdb_path, idx = args
+    env = _tls_env(lmdb_path)
+    with env.begin(buffers=True) as txn:
+        raw = bytes(txn.get(str(idx).encode()))
+    bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if bgr.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
+        bgr = cv2.resize(bgr, (IMAGE_SIZE, IMAGE_SIZE))
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return ((rgb - _MEAN) / _STD).transpose(2, 0, 1)  # (3, H, W)
+
+
+_executor = ThreadPoolExecutor(max_workers=IMG_WORKERS)
+
+
+def _fetch_images(lmdb_path: str, indices: list) -> np.ndarray:
     """
-    Load LMDB images for the given indices, preprocess, and return
-    float32 array of shape (N, 3, H, W) ready for torch.from_numpy().
+    Load + preprocess images in parallel.
+    Returns float32 (N, 3, H, W).
     """
-    imgs = []
-    with env.begin() as txn:
-        for idx in indices:
-            raw = txn.get(str(idx).encode())
-            bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if bgr.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
-                bgr = cv2.resize(bgr, (IMAGE_SIZE, IMAGE_SIZE))
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            rgb = (rgb - _MEAN) / _STD
-            imgs.append(rgb.transpose(2, 0, 1))        # (3, H, W)
-    return np.stack(imgs)                               # (N, 3, H, W)
+    args = [(lmdb_path, idx) for idx in indices]
+    return np.stack(list(_executor.map(_decode_one, args)))
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def embed_all(model: nn.Module, env, indices: list,
+def embed_all(model: nn.Module, lmdb_path: str, indices: list,
               device: torch.device) -> np.ndarray:
     """
     Embed every index in batches.
@@ -76,7 +97,7 @@ def embed_all(model: nn.Module, env, indices: list,
     for start in tqdm(range(0, len(indices), EMBED_BATCH),
                       desc="  embedding", leave=False):
         batch = indices[start: start + EMBED_BATCH]
-        x = torch.from_numpy(_fetch_images(env, batch)).to(device)
+        x = torch.from_numpy(_fetch_images(lmdb_path, batch)).to(device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             e = model(x).float()
         e = F.normalize(e, dim=1).cpu().numpy()
@@ -118,8 +139,8 @@ def min_pairwise_dist(embs: np.ndarray, device: torch.device,
 
     for start in range(0, N, row_batch):
         end  = min(start + row_batch, N)
-        rows = t[start:end]                  # (B, D)
-        d    = torch.cdist(rows, t, p=2)     # (B, N)
+        rows = t[start:end]
+        d    = torch.cdist(rows, t, p=2)
         for local_i in range(end - start):
             d[local_i, start + local_i] = float("inf")
         min_d[start:end] = d.min(dim=1).values
@@ -134,8 +155,6 @@ def train():
 
     canonical: list = json.loads(Path(CANONICAL_INDEX).read_text())
     print(f"Canonical set: {len(canonical):,} images")
-
-    env = _open_lmdb(CARDS_224)
 
     model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=0)
     model = model.to(device=device, dtype=torch.float32)
@@ -155,7 +174,7 @@ def train():
         print(f"\nEpoch {epoch}/{EPOCHS}  –  {n:,} canonical images")
 
         # ── Step 2: embed (no grad) ────────────────────────────────────────────
-        embs_np = embed_all(model, env, epoch_indices, device)     # (N, D)
+        embs_np = embed_all(model, CARDS_224, epoch_indices, device)     # (N, D)
 
         # ── Step 2b: set margin = min pairwise dist + slack ───────────────────
         epoch_min = min_pairwise_dist(embs_np, device)
@@ -163,8 +182,9 @@ def train():
         print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}")
 
         # ── Step 3: build mutable pool ────────────────────────────────────────
-        pool_idx  = list(epoch_indices)          # LMDB indices
-        pool_embs = list(embs_np)                # corresponding (D,) arrays
+        pool_idx  = list(epoch_indices)
+        pool_embs = list(embs_np)
+        active    = n
 
         total_loss  = 0.0
         total_viol  = 0
@@ -194,13 +214,13 @@ def train():
             # Gather LMDB indices for this cluster
             cluster_lmdb = [pool_idx[p] for p in cluster_pos]
 
-            # Remove cluster from pool (highest positions first to avoid index shifting)
+            # Remove cluster from pool
             for p in sorted(cluster_pos, reverse=True):
                 del pool_idx[p]
                 del pool_embs[p]
 
             # ── Forward pass with grad ─────────────────────────────────────────
-            x = torch.from_numpy(_fetch_images(env, cluster_lmdb)).to(device)
+            x = torch.from_numpy(_fetch_images(CARDS_224, cluster_lmdb)).to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 e = model(x).float()
             e = F.normalize(e, dim=1)                  # (K, D)

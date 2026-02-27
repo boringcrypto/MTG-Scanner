@@ -162,6 +162,16 @@ def api_card_info(idx: int):
     return jsonify(index=idx, found=True, **info)
 
 
+@app.get("/api/card/by-product-id/<product_id>")
+def api_card_by_product_id(product_id: str):
+    index = get_cards_index()
+    try:
+        idx = index.index(product_id)
+    except ValueError:
+        abort(404, description=f"product_id {product_id!r} not found in cards_index.json")
+    return jsonify(index=idx, product_id=product_id)
+
+
 # ── Canonical card index ──────────────────────────────────────────────────────
 # Canonical = one representative lmdb index per unique image, with excluded
 # cards removed.  Built once from canonical_map.json on first access.
