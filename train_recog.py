@@ -91,17 +91,33 @@ def embed_all(model: nn.Module, lmdb_path: str, indices: list,
     """
     Embed every index in batches.
     Returns L2-normalised float32 array of shape (N, D).
+
+    Prefetch: while the GPU processes batch N, batch N+1 is decoded in parallel.
     """
     model.eval()
-    out = []
-    for start in tqdm(range(0, len(indices), EMBED_BATCH),
-                      desc="  embedding", leave=False):
+    starts = list(range(0, len(indices), EMBED_BATCH))
+    if not starts:
+        return np.empty((0,), dtype=np.float32)
+
+    def _submit(start):
         batch = indices[start: start + EMBED_BATCH]
-        x = torch.from_numpy(_fetch_images(lmdb_path, batch)).to(device)
+        return _executor.submit(_fetch_images, lmdb_path, batch)
+
+    out = []
+    prefetch = _submit(starts[0])
+
+    for i, start in enumerate(tqdm(starts, desc="  embedding", leave=False)):
+        imgs_np = prefetch.result()
+        # Start fetching next batch immediately
+        if i + 1 < len(starts):
+            prefetch = _submit(starts[i + 1])
+
+        x = torch.from_numpy(imgs_np).to(device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             e = model(x).float()
         e = F.normalize(e, dim=1).cpu().numpy()
         out.append(e)
+
     return np.vstack(out)                               # (N, D)
 
 
@@ -196,31 +212,41 @@ def train():
 
         model.train()
 
+        def _next_cluster():
+            """Pick a random anchor and return (cluster_lmdb, cluster_pos)."""
+            anchor_pos = int(rng.integers(len(pool_idx)))
+            anchor_emb = np.asarray(pool_embs[anchor_pos])
+            pool_mat   = np.stack(pool_embs)
+            diff       = pool_mat - anchor_emb
+            dists_np   = (diff * diff).sum(axis=1) ** 0.5
+            pos        = np.argpartition(dists_np, CLUSTER_SIZE - 1)[:CLUSTER_SIZE].tolist()
+            lmdb_ids   = [pool_idx[p] for p in pos]
+            return lmdb_ids, pos
+
+        # Bootstrap: compute first cluster and start its fetch before the loop
+        cluster_lmdb, cluster_pos = _next_cluster()
+        prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+
         # ── Step 4: consume pool ───────────────────────────────────────────────
-        while len(pool_idx) >= CLUSTER_SIZE:
+        while True:
+            # Collect images fetched during last GPU step (or bootstrap)
+            imgs_np = prefetch.result()
 
-            # Anchor = random pick from pool
-            anchor_pos = rng.integers(len(pool_idx))
-            anchor_emb = np.asarray(pool_embs[anchor_pos])  # (D,)
-            pool_mat   = np.stack(pool_embs)                # (M, D)
-
-            # L2 distances from anchor to every pool member (self = 0, closest)
-            diff     = pool_mat - anchor_emb           # (M, D)
-            dists_np = (diff * diff).sum(axis=1) ** 0.5  # (M,)
-
-            # Grab the CLUSTER_SIZE positions with smallest distance (includes anchor)
-            cluster_pos = np.argpartition(dists_np, CLUSTER_SIZE - 1)[:CLUSTER_SIZE].tolist()
-
-            # Gather LMDB indices for this cluster
-            cluster_lmdb = [pool_idx[p] for p in cluster_pos]
-
-            # Remove cluster from pool
+            # Remove current cluster from pool
             for p in sorted(cluster_pos, reverse=True):
                 del pool_idx[p]
                 del pool_embs[p]
 
+            # If pool is big enough, compute NEXT cluster and prefetch its images
+            # NOW — this runs in parallel with the GPU step below
+            if len(pool_idx) >= CLUSTER_SIZE:
+                cluster_lmdb, cluster_pos = _next_cluster()
+                prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+            else:
+                prefetch = None
+
             # ── Forward pass with grad ─────────────────────────────────────────
-            x = torch.from_numpy(_fetch_images(CARDS_224, cluster_lmdb)).to(device)
+            x = torch.from_numpy(imgs_np).to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 e = model(x).float()
             e = F.normalize(e, dim=1)                  # (K, D)
@@ -249,6 +275,9 @@ def train():
             pbar.set_postfix(loss=f"{loss.item():.4f}",
                              viol=f"{viol}/{np_}",
                              pool=len(pool_idx))
+
+            if prefetch is None:
+                break  # pool exhausted, no next cluster
 
         pbar.close()
 
