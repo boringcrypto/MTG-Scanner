@@ -38,7 +38,7 @@ MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
 EPOCHS            = 100
 EMBED_BATCH       = 1024       # images per no-grad forward pass
-IMG_WORKERS       = 8          # parallel image-decode threads
+IMG_WORKERS       = 16          # parallel image-decode threads
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -198,9 +198,11 @@ def train():
         print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}")
 
         # ── Step 3: build mutable pool ────────────────────────────────────────
-        pool_idx  = list(epoch_indices)
-        pool_embs = list(embs_np)
-        active    = n
+        # Keep embeddings in a pre-allocated GPU tensor; delete by swap-to-tail
+        # so removal is O(CLUSTER_SIZE) with no reallocation.
+        pool_embs_gpu = torch.from_numpy(embs_np).to(device)   # (N, D) – mutated in-place
+        pool_idx_arr  = np.array(epoch_indices, dtype=np.int64) # (N,)   – mutated in-place
+        active        = n
 
         total_loss  = 0.0
         total_viol  = 0
@@ -213,14 +215,15 @@ def train():
         model.train()
 
         def _next_cluster():
-            """Pick a random anchor and return (cluster_lmdb, cluster_pos)."""
-            anchor_pos = int(rng.integers(len(pool_idx)))
-            anchor_emb = np.asarray(pool_embs[anchor_pos])
-            pool_mat   = np.stack(pool_embs)
-            diff       = pool_mat - anchor_emb
-            dists_np   = (diff * diff).sum(axis=1) ** 0.5
-            pos        = np.argpartition(dists_np, CLUSTER_SIZE - 1)[:CLUSTER_SIZE].tolist()
-            lmdb_ids   = [pool_idx[p] for p in pos]
+            """GPU nearest-neighbour search; returns (lmdb_ids, positions)."""
+            anchor_pos = int(rng.integers(active))
+            with torch.no_grad():
+                dists = torch.cdist(
+                    pool_embs_gpu[anchor_pos:anchor_pos + 1],
+                    pool_embs_gpu[:active],
+                ).squeeze(0)                                   # (active,)
+            pos      = torch.topk(dists, CLUSTER_SIZE, largest=False).indices.cpu().tolist()
+            lmdb_ids = [int(pool_idx_arr[p]) for p in pos]
             return lmdb_ids, pos
 
         # Bootstrap: compute first cluster and start its fetch before the loop
@@ -232,14 +235,16 @@ def train():
             # Collect images fetched during last GPU step (or bootstrap)
             imgs_np = prefetch.result()
 
-            # Remove current cluster from pool
+            # Remove current cluster from pool (swap-to-tail, O(CLUSTER_SIZE))
             for p in sorted(cluster_pos, reverse=True):
-                del pool_idx[p]
-                del pool_embs[p]
+                last = active - 1
+                pool_embs_gpu[p] = pool_embs_gpu[last]
+                pool_idx_arr[p]  = pool_idx_arr[last]
+                active -= 1
 
             # If pool is big enough, compute NEXT cluster and prefetch its images
             # NOW — this runs in parallel with the GPU step below
-            if len(pool_idx) >= CLUSTER_SIZE:
+            if active >= CLUSTER_SIZE:
                 cluster_lmdb, cluster_pos = _next_cluster()
                 prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
             else:
@@ -274,7 +279,7 @@ def train():
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}",
                              viol=f"{viol}/{np_}",
-                             pool=len(pool_idx))
+                             pool=active)
 
             if prefetch is None:
                 break  # pool exhausted, no next cluster
@@ -284,7 +289,7 @@ def train():
         avg_loss  = total_loss  / max(n_batches, 1)
         viol_rate = total_viol  / max(total_pairs, 1)
         print(f"  avg_loss={avg_loss:.4f}  violated={viol_rate:.1%}"
-              f"  batches={n_batches}  leftover={len(pool_idx)}")
+              f"  batches={n_batches}  leftover={active}")
 
         ckpt = out_dir / f"epoch_{epoch:03d}.pt"
         torch.save(model.state_dict(), ckpt)
