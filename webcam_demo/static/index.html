@@ -7,46 +7,70 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #111; color: #eee; font-family: monospace;
            display: flex; flex-direction: column; align-items: center;
-           gap: 0.75rem; padding: 1rem; }
+           gap: 0.75rem; padding: 1rem; min-height: 100vh; }
     h1 { font-size: 1.2rem; color: #0f0; }
+    #model-path { font-size: 0.65rem; color: #444; max-width: 95vw; word-break: break-all; }
     #status { font-size: 0.8rem; color: #888; min-height: 1.2em; }
 
-    /* ── Live feed (small) ── */
-    #feed-wrap { position: relative; display: inline-block; }
-    #video  { display: block; width: 240px; height: 180px; background: #000; }
-    #feed-label { font-size: 0.7rem; color: #555; text-align: center; margin-top: 2px; }
+    /* ── SCANNING PANEL ── */
+    #scan-panel { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; width: 100%; }
+    #video { display: block; width: 240px; height: 180px; background: #000; }
+    #snap  { display: block; max-width: min(640px, 95vw); border: 1px solid #333; background: #000; }
 
-    /* ── Annotated snapshot (big) ── */
-    #snap-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-    #snap { display: block; max-width: min(800px, 95vw); border: 1px solid #333;
-            background: #000; image-rendering: auto; }
-    #snap-label { font-size: 0.7rem; color: #555; }
+    /* ── RESULTS PANEL ── */
+    #results-panel { display: none; flex-direction: column; align-items: center; gap: 1rem; width: 100%; }
+    #results-row   { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; width: 100%; }
+
+    .card-tile { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    .card-tile img { display: block; border: 3px solid #555; }
+    .card-tile img.query-img { border-color: #ddd; }
+    .card-tile img.best-img  { border-color: #0c0; }
+    .card-tile img.match-img { border-color: #cc0; }
+    .tile-label { font-size: 0.65rem; color: #aaa; text-align: center; max-width: 130px; }
+
+    #btn-scan { margin-top: 0.5rem; padding: 0.6rem 2rem; font-size: 1rem;
+                background: #0a0; color: #fff; border: none; border-radius: 6px;
+                cursor: pointer; font-family: monospace; }
+    #btn-scan:hover { background: #0c0; }
   </style>
 </head>
 <body>
   <h1>MTG Card Corner Detector</h1>
-  <div id="model-path" style="font-size:0.65rem;color:#444;max-width:95vw;word-break:break-all;">model: …</div>
+  <div id="model-path">model: …</div>
   <div id="status">Starting camera…</div>
 
-  <div id="feed-wrap">
+  <!-- SCANNING PANEL -->
+  <div id="scan-panel">
     <video id="video" autoplay playsinline muted></video>
-  </div>
-  <div id="feed-label">live feed</div>
-
-  <div id="snap-wrap">
+    <div style="font-size:0.7rem;color:#555">live feed</div>
     <img id="snap" alt="last detection" />
-    <div id="snap-label">last scanned frame</div>
+    <div style="font-size:0.7rem;color:#555">last scanned frame</div>
+  </div>
+
+  <!-- RESULTS PANEL -->
+  <div id="results-panel">
+    <div id="results-row"></div>
+    <button id="btn-scan" onclick="returnToScan()">&#8635; Scan again</button>
   </div>
 
 <script>
-const video  = document.getElementById("video");
-const snap   = document.getElementById("snap");
-const status = document.getElementById("status");
+const video        = document.getElementById("video");
+const snap         = document.getElementById("snap");
+const status       = document.getElementById("status");
+const scanPanel    = document.getElementById("scan-panel");
+const resultsPanel = document.getElementById("results-panel");
+const resultsRow   = document.getElementById("results-row");
 
-const CAPTURE_W = 640;
-const CAPTURE_H = 480;
-const FPS       = 15;
-const CONF_MIN  = 0.4;
+const CAPTURE_W  = 640;
+const CAPTURE_H  = 480;
+const FPS        = 15;
+const CONF_SCAN  = 0.4;   // show overlay above this
+const CONF_RECOG = 0.80;  // trigger recognition above this
+
+let scanning = true;
+let busy     = false;
+
+// ── Camera ────────────────────────────────────────────────────────────────────
 
 async function startCamera() {
   try {
@@ -65,14 +89,11 @@ async function startCamera() {
 
 const capture = document.createElement("canvas");
 const capCtx  = capture.getContext("2d");
-let   busy    = false;
 
-function scheduleFrame() {
-  setTimeout(sendFrame, 1000 / FPS);
-}
+function scheduleFrame() { setTimeout(sendFrame, 1000 / FPS); }
 
 async function sendFrame() {
-  if (busy) { scheduleFrame(); return; }
+  if (!scanning || busy) { if (scanning) scheduleFrame(); return; }
   busy = true;
 
   capture.width  = video.videoWidth  || CAPTURE_W;
@@ -82,25 +103,24 @@ async function sendFrame() {
   capture.toBlob(async (blob) => {
     try {
       const resp = await fetch("/detect", {
-        method: "POST",
-        headers: { "Content-Type": "image/jpeg" },
-        body: blob
+        method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob
       });
       const data = await resp.json();
-      const dets = (data.detections || []).filter(d => d.conf >= CONF_MIN);
+      const dets = (data.detections || []).filter(d => d.conf >= CONF_SCAN);
 
-      // Always update the annotated snapshot
-      if (data.annotated) {
-        snap.src = "data:image/jpeg;base64," + data.annotated;
+      if (data.annotated) snap.src = "data:image/jpeg;base64," + data.annotated;
+
+      // Best detection above recognition threshold → switch to results mode
+      const best = dets.reduce((b, d) => (!b || d.conf > b.conf) ? d : b, null);
+      if (best && best.conf >= CONF_RECOG) {
+        scanning = false;
+        status.textContent = `Recognising… (conf ${(best.conf * 100).toFixed(0)}%)`;
+        await runRecognize(blob);
+        return;
       }
 
-      const n = dets.length;
-      const corners = ["TL","TR","BR","BL"];
-      status.textContent = n > 0
-        ? dets.map(d =>
-            `${(d.conf*100).toFixed(0)}% — ` +
-            corners.map((lbl,i) => `${lbl}:(${d.corners[i][0].toFixed(3)},${d.corners[i][1].toFixed(3)})`).join(" ")
-          ).join(" | ")
+      status.textContent = dets.length > 0
+        ? dets.map(d => `${(d.conf * 100).toFixed(0)}%`).join(" | ") + " — hold card steady…"
         : "No cards detected";
     } catch (e) {
       status.textContent = "Server error: " + e.message;
@@ -111,8 +131,74 @@ async function sendFrame() {
   }, "image/jpeg", 0.85);
 }
 
-startCamera();
+// ── Recognition ──────────────────────────────────────────────────────────────
 
+async function runRecognize(blob) {
+  try {
+    const resp = await fetch("/recognize", {
+      method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob
+    });
+    const data = await resp.json();
+
+    if (!data.card || !data.matches || data.matches.length === 0) {
+      status.textContent = "Could not recognise — try again.";
+      scanning = true; busy = false; scheduleFrame();
+      return;
+    }
+    showResults(data);
+  } catch (e) {
+    status.textContent = "Recognise error: " + e.message;
+    scanning = true; busy = false; scheduleFrame();
+  }
+}
+
+function showResults(data) {
+  resultsRow.innerHTML = "";
+
+  // Captured card (query)
+  resultsRow.appendChild(makeTile(
+    "data:image/jpeg;base64," + data.card, "Captured card", "query-img", 130, 182
+  ));
+
+  // Top-5 matches
+  data.matches.forEach((m, i) => {
+    resultsRow.appendChild(makeTile(
+      "data:image/jpeg;base64," + m.thumb,
+      `#${m.rank}  d=${m.distance}  ${(m.similarity * 100).toFixed(1)}%`,
+      i === 0 ? "best-img" : "match-img",
+      130, 182
+    ));
+  });
+
+  status.textContent = `Best match: ${(data.matches[0].similarity * 100).toFixed(1)}% similar`;
+  scanPanel.style.display    = "none";
+  resultsPanel.style.display = "flex";
+}
+
+function makeTile(src, label, cls, w, h) {
+  const div = document.createElement("div");
+  div.className = "card-tile";
+  const img = document.createElement("img");
+  img.src = src; img.width = w; img.height = h; img.className = cls;
+  const lbl = document.createElement("div");
+  lbl.className = "tile-label"; lbl.textContent = label;
+  div.appendChild(img); div.appendChild(lbl);
+  return div;
+}
+
+// ── Return to scan ────────────────────────────────────────────────────────────
+
+function returnToScan() {
+  resultsPanel.style.display = "none";
+  scanPanel.style.display    = "flex";
+  status.textContent = "Camera ready — detecting…";
+  scanning = true; busy = false;
+  scheduleFrame();
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+startCamera();
 fetch("/model").then(r => r.json()).then(d => {
   document.getElementById("model-path").textContent = "model: " + d.path;
 });

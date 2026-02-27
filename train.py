@@ -97,6 +97,10 @@ def train(args):
         model = YOLO(args.checkpoint)
         model.train(resume=True)
     else:
+        # Redirect Ultralytics pretrained-weight downloads to models/
+        from ultralytics.utils import SETTINGS
+        Path("models").mkdir(exist_ok=True)
+        SETTINGS.update({"weights_dir": str(Path("models").resolve())})
         model = YOLO(args.model)
 
         if args.debug:
@@ -275,7 +279,7 @@ def main():
     p.add_argument("--debug-n",    type=int, default=3,    dest="debug_n", help="Number of samples to print in --debug mode")
     p.add_argument("--cooldown",    type=int, default=60,     help="Seconds to sleep between epochs (GPU cooling)")
     p.add_argument("--batch-pause", type=float, default=3, dest="batch_pause", help="Seconds to sleep after each batch (throttles GPU)")
-    p.add_argument("--cards",      default="cards.lmdb",   help="Path to cards.lmdb (streaming mode)")
+    p.add_argument("--cards",      default="data/cards/cards.lmdb",   help="Path to cards.lmdb (streaming mode)")
     p.add_argument("--bgs",        default="backgrounds.lmdb", help="Path to backgrounds.lmdb (streaming mode)")
 
     args = p.parse_args()

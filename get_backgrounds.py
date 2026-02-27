@@ -91,13 +91,22 @@ def _resize_encode(img: np.ndarray) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 
+from lmdb_writer import LmdbWriter
+
+
 class _LmdbWriter:
     """Context manager that batches LMDB puts and tracks the global index."""
 
     def __init__(self, index: dict):
         self.index = index
-        self._map_size = LMDB_INIT_SIZE
-        self.env   = _open_lmdb(write=True, map_size=self._map_size)
+        self._writer = LmdbWriter(
+            str(LMDB_PATH),
+            initial_size=LMDB_INIT_SIZE,
+            grow_size=LMDB_GROW_SIZE,
+            lock=True,
+            readahead=False,
+            meminit=False,
+        )
         self.batch: dict[bytes, bytes] = {}
         self._start_count = index["count"]
 
@@ -111,25 +120,13 @@ class _LmdbWriter:
     def _flush(self) -> None:
         if not self.batch:
             return
-        for attempt in range(1, 1001):
-            try:
-                with self.env.begin(write=True) as txn:
-                    for k, v in self.batch.items():
-                        txn.put(k, v)
-                self.batch.clear()
-                return
-            except lmdb.MapFullError:
-                self._map_size += LMDB_GROW_SIZE
-                print(f"\nLMDB full — growing to {self._map_size // 1024**2} MB (attempt {attempt})")
-                self.env.close()
-                self.env = _open_lmdb(write=True, map_size=self._map_size)
-        raise RuntimeError("LMDB growth did not resolve MapFullError after 1000 attempts — disk may be full")
+        self._writer.put_batch(self.batch)
+        self.batch.clear()
 
     def close(self) -> int:
         self._flush()
-        with self.env.begin(write=True) as txn:
-            txn.put(b"__len__", str(self.index["count"]).encode())
-        self.env.close()
+        self._writer.put(b"__len__", str(self.index["count"]).encode())
+        self._writer.close()
         return self.index["count"] - self._start_count
 
 

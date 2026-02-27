@@ -16,38 +16,23 @@ Run once before generating the training set:
 """
 
 import argparse
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
-import lmdb
 import numpy as np
 from tqdm import tqdm
 
+from lmdb_writer import LmdbWriter
+
 MAX_HEIGHT = 640
 DEFAULT_SRC = "C:\\card_images"
-DEFAULT_OUT = "cards.lmdb"
+DEFAULT_OUT = "data/cards/cards.lmdb"
 JPEG_QUALITY = 75
 LMDB_INIT_SIZE = 250 * 1024 ** 2   # start at 250 MB
 LMDB_GROW_SIZE = 250 * 1024 ** 2   # grow by 250 MB whenever the db is full
-
-
-def _put_batch(out_path: str, env_holder: list, batch: dict) -> None:
-    """Write *batch* to LMDB, auto-growing by LMDB_GROW_SIZE on MapFullError."""
-    for attempt in range(1, 10):
-        try:
-            with env_holder[0].begin(write=True) as txn:
-                for k, v in batch.items():
-                    txn.put(k, v)
-            return
-        except lmdb.MapFullError:
-            cur = env_holder[0].info()["map_size"]
-            new = cur + LMDB_GROW_SIZE
-            print(f"\nLMDB full at {cur // 1024**2} MB — growing to {new // 1024**2} MB (attempt {attempt})")
-            env_holder[0].close()
-            env_holder[0] = lmdb.open(out_path, map_size=new)
-    raise RuntimeError("LMDB growth did not resolve MapFullError after 1000 attempts — disk may be full")
 
 
 def encode(src_path: Path, max_height: int):
@@ -83,26 +68,34 @@ def main():
         return encode(src_path, args.height)
 
     BATCH = 500
-    env_holder = [lmdb.open(args.out, map_size=LMDB_INIT_SIZE)]
     idx = 0
     batch = {}
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for data in tqdm(ex.map(job, src_paths), total=len(src_paths), desc="encoding"):
-            if data is None:
-                continue
-            batch[str(idx).encode()] = data
-            idx += 1
-            if len(batch) >= BATCH:
-                _put_batch(args.out, env_holder, batch)
-                batch.clear()
+    names: list[str] = []   # idx → original filename stem
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with LmdbWriter(args.out, initial_size=LMDB_INIT_SIZE, grow_size=LMDB_GROW_SIZE) as writer:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for data, src_path in tqdm(
+                zip(ex.map(job, src_paths), src_paths),
+                total=len(src_paths), desc="encoding"
+            ):
+                if data is None:
+                    continue
+                batch[str(idx).encode()] = data
+                names.append(src_path.stem)
+                idx += 1
+                if len(batch) >= BATCH:
+                    writer.put_batch(batch)
+                    batch.clear()
 
-    if batch:
-        _put_batch(args.out, env_holder, batch)
+        if batch:
+            writer.put_batch(batch)
+        writer.put(b"__len__", str(idx).encode())
 
-    _put_batch(args.out, env_holder, {b"__len__": str(idx).encode()})
-    env_holder[0].close()
-
-    print(f"Done — {idx} cards written to {args.out}")
+    index_path = out_path.parent / "cards_index.json"
+    index_path.write_text(json.dumps(names, indent=None))
+    print(f"Done \u2014 {idx} cards written to {args.out}")
+    print(f"Index mapping written to {index_path}")
 
 
 if __name__ == "__main__":

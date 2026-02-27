@@ -12,16 +12,25 @@ class CardDataset(Dataset):
     Reads pre-processed portrait cards from a single LMDB file.
     Each value is a JPEG-encoded BGR image; add_alpha() is applied on load.
     """
-    def __init__(self, lmdb_path="cards.lmdb"):
-        self.env = lmdb.open(lmdb_path, readonly=True, lock=False,
-                             readahead=False, meminit=False)
-        with self.env.begin() as txn:
+    def __init__(self, lmdb_path="data/cards/cards.lmdb"):
+        self._lmdb_path = lmdb_path
+        self.env = None  # opened lazily per worker
+        _env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                         readahead=False, meminit=False)
+        with _env.begin() as txn:
             self._len = int(txn.get(b"__len__").decode())
+        _env.close()
+
+    def _open_env(self):
+        if self.env is None:
+            self.env = lmdb.open(self._lmdb_path, readonly=True,
+                                 lock=False, readahead=False, meminit=False)
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, idx):
+        self._open_env()
         with Timer("card_fetch", logger=None):
             with self.env.begin() as txn:
                 data = txn.get(str(idx).encode())
@@ -40,15 +49,24 @@ class BackgroundDataset(Dataset):
     Each value is a JPEG-encoded BGR image; cropping is done at sample-generation time.
     """
     def __init__(self, lmdb_path="backgrounds.lmdb"):
-        self.env = lmdb.open(lmdb_path, readonly=True, lock=False,
-                             readahead=False, meminit=False)
-        with self.env.begin() as txn:
+        self._lmdb_path = lmdb_path
+        self.env = None  # opened lazily per worker
+        _env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                         readahead=False, meminit=False)
+        with _env.begin() as txn:
             self._len = int(txn.get(b"__len__").decode())
+        _env.close()
+
+    def _open_env(self):
+        if self.env is None:
+            self.env = lmdb.open(self._lmdb_path, readonly=True,
+                                 lock=False, readahead=False, meminit=False)
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, idx):
+        self._open_env()
         with self.env.begin() as txn:
             data = txn.get(str(idx).encode())
         return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)

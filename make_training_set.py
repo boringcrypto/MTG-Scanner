@@ -235,6 +235,24 @@ def generate(total, card_root, bg_root, out_dir, num_workers=14):
               f"n={t.count(name)}")
 
 
+# ── Geometry helpers (reusable) ──────────────────────────────────────────────
+
+def warp_to_rect(img, pts_px, out_w, out_h):
+    """
+    Perspective-warp 4 corners (TL TR BR BL, pixel coords) to an upright
+    out_w × out_h rectangle.
+    """
+    src = pts_px.astype(np.float32)
+    dst = np.array([
+        [0,       0       ],
+        [out_w-1, 0       ],
+        [out_w-1, out_h-1 ],
+        [0,       out_h-1 ],
+    ], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (out_w, out_h))
+
+
 # ── OBB visualisation helper (reusable) ──────────────────────────────────────
 
 def show_pose(img_bgr, label, window="Pose preview"):
@@ -289,7 +307,7 @@ def test_preview(cards_root, bg_root):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--total",    type=int, default=10000)
-    parser.add_argument("--cards",    default="cards.lmdb")
+    parser.add_argument("--cards",    default="data/cards/cards.lmdb")
     parser.add_argument("--bgs",      default="backgrounds.lmdb")
     parser.add_argument("--out",      default="dataset")
     parser.add_argument("--workers",  type=int, default=14,
