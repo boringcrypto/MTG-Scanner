@@ -34,7 +34,7 @@ CARDS_224         = "data/cards/cards_224.lmdb"
 CANONICAL_INDEX   = "data/cards/canonical_index.json"
 CHECKPOINT_DIR    = "runs/recog"
 CLUSTER_SIZE      = 128        # anchor + 127 nearest neighbours
-MARGIN_SLACK      = 0.2        # added on top of current min pairwise distance
+MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
 EPOCHS            = 100
 EMBED_BATCH       = 1024       # images per no-grad forward pass
@@ -144,14 +144,16 @@ def repulsion_loss(embs: torch.Tensor, margin: float) -> torch.Tensor:
 # ── Dynamic margin ───────────────────────────────────────────────────────────
 
 def min_pairwise_dist(embs: np.ndarray, device: torch.device,
-                      row_batch: int = 512) -> float:
+                      row_batch: int = 512) -> tuple[float, int, int]:
     """
     Minimum nearest-neighbour L2 distance across all embeddings.
+    Returns (min_dist, row_index i, col_index j) of the closest pair.
     Uses torch.cdist in row batches on the same device as training.
     """
     N = len(embs)
     t = torch.from_numpy(embs).to(device)
-    min_d = torch.full((N,), float("inf"), device=device)
+    min_d   = torch.full((N,), float("inf"), device=device)
+    min_col = torch.zeros(N, dtype=torch.long, device=device)
 
     for start in range(0, N, row_batch):
         end  = min(start + row_batch, N)
@@ -159,9 +161,13 @@ def min_pairwise_dist(embs: np.ndarray, device: torch.device,
         d    = torch.cdist(rows, t, p=2)
         for local_i in range(end - start):
             d[local_i, start + local_i] = float("inf")
-        min_d[start:end] = d.min(dim=1).values
+        result = d.min(dim=1)
+        min_d[start:end]   = result.values
+        min_col[start:end] = result.indices
 
-    return float(min_d.min().item())
+    i = int(min_d.argmin().item())
+    j = int(min_col[i].item())
+    return float(min_d[i].item()), i, j
 
 
 
@@ -193,9 +199,10 @@ def train():
         embs_np = embed_all(model, CARDS_224, epoch_indices, device)     # (N, D)
 
         # ── Step 2b: set margin = min pairwise dist + slack ───────────────────
-        epoch_min = min_pairwise_dist(embs_np, device)
+        epoch_min, close_i, close_j = min_pairwise_dist(embs_np, device)
         margin = epoch_min + MARGIN_SLACK
-        print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}")
+        print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}"
+              f"  closest=({epoch_indices[close_i]}, {epoch_indices[close_j]})")
 
         # ── Step 3: build mutable pool ────────────────────────────────────────
         # Keep embeddings in a pre-allocated GPU tensor; delete by swap-to-tail
