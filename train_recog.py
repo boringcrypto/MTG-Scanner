@@ -36,7 +36,7 @@ CHECKPOINT_DIR    = "runs/recog"
 CLUSTER_SIZE      = 128        # anchor + 127 nearest neighbours
 MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
-EPOCHS            = 100
+EPOCHS            = 500
 EMBED_BATCH       = 1024       # images per no-grad forward pass
 IMG_WORKERS       = 16          # parallel image-decode threads
 
