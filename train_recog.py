@@ -265,7 +265,7 @@ def train():
             lmdb_ids = [int(pool_idx_arr[p]) for p in pos]
             return lmdb_ids, pos
 
-        _debug_first_round = True  # print diagnostics for the first round only
+        _debug_first_round = True  # set True temporarily to diagnose first-step behaviour
 
         # ── Step 4: REFRESH_STEPS rounds ──────────────────────────────────────
         for refresh_i in range(REFRESH_STEPS):
@@ -302,27 +302,26 @@ def train():
                     _debug_first_round = False
                     with torch.no_grad():
                         dm_dbg = torch.cdist(e, e, p=2)
-                        close_i_dbg = close_i  # pool pos of closest pair from min_pairwise_dist
-                        close_j_dbg = close_j
-                        # find where those pool positions appear in the cluster
                         c_pos_list = cluster_pos
-                        pos_in_cluster_i = c_pos_list.index(close_i_dbg) if close_i_dbg in c_pos_list else None
-                        pos_in_cluster_j = c_pos_list.index(close_j_dbg) if close_j_dbg in c_pos_list else None
-                        print(f"\n  [DEBUG] Cluster size: {len(c_pos_list)}")
-                        print(f"  [DEBUG] Closest pair pool positions: {close_i_dbg}, {close_j_dbg}")
-                        print(f"  [DEBUG] In cluster at indices: {pos_in_cluster_i}, {pos_in_cluster_j}")
+                        # close_i / close_j are pool-array positions from min_pairwise_dist
+                        pos_in_cluster_i = c_pos_list.index(close_i) if close_i in c_pos_list else None
+                        pos_in_cluster_j = c_pos_list.index(close_j) if close_j in c_pos_list else None
+                        print(f"\n  [DEBUG] === First step diagnostics ===")
+                        print(f"  [DEBUG] min_pairwise_dist reported:")
+                        print(f"           pool pos {close_i} = lmdb id {epoch_indices[close_i]}")
+                        print(f"           pool pos {close_j} = lmdb id {epoch_indices[close_j]}")
+                        print(f"           dist = {epoch_min:.6f}")
+                        print(f"  [DEBUG] _next_cluster selected anchor pool pos: {c_pos_list[0]}"
+                              f" = lmdb id {epoch_indices[c_pos_list[0]]}")
+                        print(f"  [DEBUG] Closest pair in cluster at indices: {pos_in_cluster_i}, {pos_in_cluster_j}")
                         if pos_in_cluster_i is not None and pos_in_cluster_j is not None:
                             d_pair = dm_dbg[pos_in_cluster_i, pos_in_cluster_j].item()
                             print(f"  [DEBUG] Recomputed dist in forward pass: {d_pair:.6f}")
-                            print(f"  [DEBUG] Pool distance (min_d_gpu): {min_d_gpu[close_i_dbg].item():.6f}")
                         else:
-                            print(f"  [DEBUG] *** One or both cards NOT in cluster! ***")
-                        pool_a = pool_embs_gpu[close_i_dbg]
-                        pool_b = pool_embs_gpu[close_j_dbg]
-                        pool_dist_direct = (pool_a - pool_b).norm().item()
-                        print(f"  [DEBUG] Direct pool vector dist: {pool_dist_direct:.6f}")
-                        print(f"  [DEBUG] margin={margin:.6f},  loss pre-step={repulsion_loss(e, margin).item():.6f}")
-                        print(f"  [DEBUG] model.training={model.training}")
+                            print(f"  [DEBUG] *** One or both closest cards NOT in this cluster ***")
+                        print(f"  [DEBUG] Pool dist (direct vectors): {(pool_embs_gpu[close_i] - pool_embs_gpu[close_j]).norm().item():.6f}")
+                        print(f"  [DEBUG] min_d_gpu[close_i]: {min_d_gpu[close_i].item():.6f}")
+                        print(f"  [DEBUG] margin={margin:.6f},  loss={repulsion_loss(e, margin).item():.6f}")
 
                 loss = repulsion_loss(e, margin)
                 if loss.item() > 0:
@@ -380,11 +379,14 @@ def train():
             # Update min_d for re-embedded rows (batched to cap VRAM)
             _refresh_min_d(pool_embs_gpu, min_d_gpu, touched_t)
 
-            # Update margin to reflect current state
+            # Report current min but keep margin fixed for the epoch.
+            # Resetting margin = new_min + slack here would cause an infinite
+            # loop: partial re-embed snaps the hard pair back to its original
+            # distance, margin resets to the same violated value, and the next
+            # round repeats identically forever.
             new_min = float(min_d_gpu.min().item())
-            margin  = new_min + MARGIN_SLACK
             print(f"  [round {refresh_i + 1}] min_dist={new_min:.4f}"
-                  f"  margin={margin:.4f}")
+                  f"  margin={margin:.4f} (epoch-fixed)")
 
         avg_loss  = total_loss  / max(n_batches, 1)
         viol_rate = total_viol  / max(total_pairs, 1)
