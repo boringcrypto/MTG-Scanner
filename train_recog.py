@@ -35,11 +35,11 @@ from card_hasher import MODEL_NAME, IMAGE_SIZE, _MEAN, _STD
 CARDS_224         = "data/cards/cards_224.lmdb"
 CANONICAL_INDEX   = "data/cards/canonical_index.json"
 CHECKPOINT_DIR    = "runs/recog"
-CLUSTER_SIZE      = 128        # anchor + 127 nearest neighbours
+CLUSTER_SIZE      = 64        # anchor + 127 nearest neighbours
 MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
 EPOCHS            = 500
-EMBED_BATCH          = 128    # images per no-grad forward pass
+EMBED_BATCH          = CLUSTER_SIZE    # images per no-grad forward pass
 IMG_WORKERS          = 16      # parallel image-decode threads
 REFRESH_STEPS        = 10      # partial re-embed rounds per epoch
 
