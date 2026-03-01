@@ -174,6 +174,21 @@ def min_pairwise_dist(embs: np.ndarray, device: torch.device,
     return float(min_d[i].item()), i, j, min_d
 
 
+@torch.no_grad()
+def _refresh_min_d(pool_embs: torch.Tensor, min_d: torch.Tensor,
+                   row_indices: torch.Tensor, row_batch: int = 512) -> None:
+    """
+    Update min_d[row_indices] in-place.
+    Batches cdist to cap VRAM at row_batch × N × 4 bytes (~200 MB at 512 rows, 100k pool).
+    """
+    device = pool_embs.device
+    for start in range(0, len(row_indices), row_batch):
+        end = min(start + row_batch, len(row_indices))
+        idx = row_indices[start:end]
+        d   = torch.cdist(pool_embs[idx], pool_embs)          # (batch, N)
+        d[torch.arange(end - start, device=device), idx] = float('inf')
+        min_d[idx] = d.min(dim=1).values
+
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,10 +299,7 @@ def train():
                     e_det         = e.detach()
 
                     pool_embs_gpu[cluster_pos_t] = e_det
-                    sub_dists = torch.cdist(e_det, pool_embs_gpu)          # (K, N)
-                    sub_dists[torch.arange(K, device=device),
-                              cluster_pos_t] = float('inf')
-                    min_d_gpu[cluster_pos_t] = sub_dists.min(dim=1).values
+                    _refresh_min_d(pool_embs_gpu, min_d_gpu, cluster_pos_t)
 
                     dm   = torch.cdist(e_det, e_det, p=2)
                     mask = torch.triu(torch.ones(K, K, device=device,
@@ -326,12 +338,8 @@ def train():
             touched_t = torch.tensor(touched_list, dtype=torch.long, device=device)
             pool_embs_gpu[touched_t] = torch.from_numpy(fresh_np).to(device)
 
-            # Update min_d for re-embedded rows
-            with torch.no_grad():
-                T   = len(touched_t)
-                sub = torch.cdist(pool_embs_gpu[touched_t], pool_embs_gpu)  # (T, N)
-                sub[torch.arange(T, device=device), touched_t] = float('inf')
-                min_d_gpu[touched_t] = sub.min(dim=1).values
+            # Update min_d for re-embedded rows (batched to cap VRAM)
+            _refresh_min_d(pool_embs_gpu, min_d_gpu, touched_t)
 
             # Update margin to reflect current state
             new_min = float(min_d_gpu.min().item())
