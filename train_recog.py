@@ -39,7 +39,7 @@ CLUSTER_SIZE      = 128        # anchor + 127 nearest neighbours
 MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
 LR                = 3e-5
 EPOCHS            = 500
-EMBED_BATCH          = 1024    # images per no-grad forward pass
+EMBED_BATCH          = 128    # images per no-grad forward pass
 IMG_WORKERS          = 16      # parallel image-decode threads
 REFRESH_STEPS        = 10      # partial re-embed rounds per epoch
 
@@ -116,8 +116,7 @@ def embed_all(model: nn.Module, lmdb_path: str, indices: list,
             prefetch = _submit(starts[i + 1])
 
         x = torch.from_numpy(imgs_np).to(device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            e = model(x).float()
+        e = model(x)
         e = F.normalize(e, dim=1).cpu().numpy()
         out.append(e)
 
@@ -294,8 +293,7 @@ def train():
 
                 # ── Forward + backward ─────────────────────────────────────────
                 x = torch.from_numpy(imgs_np).to(device)
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    e = model(x).float()
+                e = model(x)
                 e = F.normalize(e, dim=1)                      # (K, D)
 
                 if _debug_first_round:
