@@ -50,6 +50,9 @@ export default {
           <router-link to="/sets" class="btn btn-outline-info w-100">
             <i class="bi bi-collection me-2"></i>Browse by Set
           </router-link>
+          <router-link to="/compare" class="btn btn-outline-secondary w-100">
+            <i class="bi bi-layout-split me-2"></i>Compare Two Cards
+          </router-link>
         </div>
 
       </div>

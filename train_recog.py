@@ -199,6 +199,17 @@ def train():
 
     model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=0)
     model = model.to(device=device, dtype=torch.float32)
+
+    bn_layers = [name for name, m in model.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+
+    if bn_layers:
+        print(f"✅ Found {len(bn_layers)} Batch Normalization layers!")
+        print("First 3 BN layers found:", bn_layers[:3])
+    else:
+        print("❌ No Batch Normalization layers found. Checking for LayerNorm...")
+        ln_layers = [name for name, m in model.named_modules() if isinstance(m, nn.LayerNorm)]
+        print(f"Found {len(ln_layers)} LayerNorm layers instead.")
+
     print("Model loaded.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -254,6 +265,8 @@ def train():
             lmdb_ids = [int(pool_idx_arr[p]) for p in pos]
             return lmdb_ids, pos
 
+        _debug_first_round = True  # print diagnostics for the first round only
+
         # ── Step 4: REFRESH_STEPS rounds ──────────────────────────────────────
         for refresh_i in range(REFRESH_STEPS):
 
@@ -284,6 +297,32 @@ def train():
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     e = model(x).float()
                 e = F.normalize(e, dim=1)                      # (K, D)
+
+                if _debug_first_round:
+                    _debug_first_round = False
+                    with torch.no_grad():
+                        dm_dbg = torch.cdist(e, e, p=2)
+                        close_i_dbg = close_i  # pool pos of closest pair from min_pairwise_dist
+                        close_j_dbg = close_j
+                        # find where those pool positions appear in the cluster
+                        c_pos_list = cluster_pos
+                        pos_in_cluster_i = c_pos_list.index(close_i_dbg) if close_i_dbg in c_pos_list else None
+                        pos_in_cluster_j = c_pos_list.index(close_j_dbg) if close_j_dbg in c_pos_list else None
+                        print(f"\n  [DEBUG] Cluster size: {len(c_pos_list)}")
+                        print(f"  [DEBUG] Closest pair pool positions: {close_i_dbg}, {close_j_dbg}")
+                        print(f"  [DEBUG] In cluster at indices: {pos_in_cluster_i}, {pos_in_cluster_j}")
+                        if pos_in_cluster_i is not None and pos_in_cluster_j is not None:
+                            d_pair = dm_dbg[pos_in_cluster_i, pos_in_cluster_j].item()
+                            print(f"  [DEBUG] Recomputed dist in forward pass: {d_pair:.6f}")
+                            print(f"  [DEBUG] Pool distance (min_d_gpu): {min_d_gpu[close_i_dbg].item():.6f}")
+                        else:
+                            print(f"  [DEBUG] *** One or both cards NOT in cluster! ***")
+                        pool_a = pool_embs_gpu[close_i_dbg]
+                        pool_b = pool_embs_gpu[close_j_dbg]
+                        pool_dist_direct = (pool_a - pool_b).norm().item()
+                        print(f"  [DEBUG] Direct pool vector dist: {pool_dist_direct:.6f}")
+                        print(f"  [DEBUG] margin={margin:.6f},  loss pre-step={repulsion_loss(e, margin).item():.6f}")
+                        print(f"  [DEBUG] model.training={model.training}")
 
                 loss = repulsion_loss(e, margin)
                 if loss.item() > 0:

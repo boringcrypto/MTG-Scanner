@@ -21,7 +21,7 @@ import lmdb
 import cv2
 import numpy as np
 from pathlib import Path
-from flask import Flask, send_file, jsonify, send_from_directory, abort
+from flask import Flask, send_file, jsonify, send_from_directory, abort, request
 
 # ── Paths (resolved relative to this file) ────────────────────────────────────
 ROOT        = Path(__file__).resolve().parent.parent
@@ -325,6 +325,46 @@ def api_set_cards(set_id: str):
     ]
     cards.sort(key=lambda c: _sort_key(c.get("number")))
     return jsonify(cards)
+
+
+# ── Compare / mark-duplicate ─────────────────────────────────────────────────
+
+@app.post("/api/compare/mark-duplicate")
+def api_mark_duplicate():
+    global _canonical_cache, _canonical_meta, _dupes_cache
+    data = request.get_json(force=True)
+    try:
+        canonical_idx = int(data["canonical_idx"])
+        duplicate_idx = int(data["duplicate_idx"])
+    except (KeyError, TypeError, ValueError):
+        abort(400)
+
+    if canonical_idx == duplicate_idx:
+        return jsonify(error="canonical and duplicate indices must differ"), 400
+
+    # Update canonical_map.json
+    cm = get_canonical_map()
+    cm.setdefault("resolved", []).append({
+        "indices": [canonical_idx, duplicate_idx],
+        "canonical_idx": canonical_idx,
+        "rule": "manual",
+    })
+    cm.setdefault("stats", {})["resolved"] = len(cm["resolved"])
+    CANONICAL_MAP.write_text(json.dumps(cm, indent=2))
+
+    # Update canonical_index.json — remove the duplicate
+    if CANONICAL_INDEX.exists():
+        idx_list: list = json.loads(CANONICAL_INDEX.read_text())
+        if duplicate_idx in idx_list:
+            idx_list.remove(duplicate_idx)
+            CANONICAL_INDEX.write_text(json.dumps(idx_list))
+
+    # Invalidate caches
+    _canonical_cache = None
+    _canonical_meta  = None
+    _dupes_cache     = None
+
+    return jsonify(ok=True, canonical_idx=canonical_idx, duplicate_idx=duplicate_idx)
 
 
 # ── SPA fallback — serve index.html for any non-API route ────────────────────
