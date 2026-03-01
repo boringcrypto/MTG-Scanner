@@ -144,11 +144,12 @@ def repulsion_loss(embs: torch.Tensor, margin: float) -> torch.Tensor:
 # ── Dynamic margin ───────────────────────────────────────────────────────────
 
 def min_pairwise_dist(embs: np.ndarray, device: torch.device,
-                      row_batch: int = 512) -> tuple[float, int, int]:
+                      row_batch: int = 512) -> tuple[float, int, int, torch.Tensor]:
     """
     Minimum nearest-neighbour L2 distance across all embeddings.
-    Returns (min_dist, row_index i, col_index j) of the closest pair.
-    Uses torch.cdist in row batches on the same device as training.
+    Returns (min_dist, row_index i, col_index j, min_d_tensor).
+    min_d_tensor[k] = distance from k to its nearest neighbour (GPU, shape (N,)).
+    Used as a lower-bound priority queue for anchor selection during training.
     """
     N = len(embs)
     t = torch.from_numpy(embs).to(device)
@@ -167,7 +168,7 @@ def min_pairwise_dist(embs: np.ndarray, device: torch.device,
 
     i = int(min_d.argmin().item())
     j = int(min_col[i].item())
-    return float(min_d[i].item()), i, j
+    return float(min_d[i].item()), i, j, min_d
 
 
 
@@ -199,7 +200,7 @@ def train():
         embs_np = embed_all(model, CARDS_224, epoch_indices, device)     # (N, D)
 
         # ── Step 2b: set margin = min pairwise dist + slack ───────────────────
-        epoch_min, close_i, close_j = min_pairwise_dist(embs_np, device)
+        epoch_min, close_i, close_j, min_d_gpu = min_pairwise_dist(embs_np, device)
         margin = epoch_min + MARGIN_SLACK
         print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}"
               f"  closest=({epoch_indices[close_i]}, {epoch_indices[close_j]})")
@@ -207,6 +208,8 @@ def train():
         # ── Step 3: build mutable pool ────────────────────────────────────────
         # Keep embeddings in a pre-allocated GPU tensor; delete by swap-to-tail
         # so removal is O(CLUSTER_SIZE) with no reallocation.
+        # min_d_gpu[k] is a lower bound on k's true NN distance (stale after swaps)
+        # and acts as a priority queue: argmin → hardest anchor.
         pool_embs_gpu = torch.from_numpy(embs_np).to(device)   # (N, D) – mutated in-place
         pool_idx_arr  = np.array(epoch_indices, dtype=np.int64) # (N,)   – mutated in-place
         active        = n
@@ -222,19 +225,33 @@ def train():
         model.train()
 
         def _next_cluster():
-            """GPU nearest-neighbour search; returns (lmdb_ids, positions)."""
-            anchor_pos = int(rng.integers(active))
+            """
+            Pick the anchor with the lowest stale NN distance (hardest pair),
+            verify its true NN distance, and return None if epoch is done.
+            """
+            anchor_pos = int(min_d_gpu[:active].argmin().item())
             with torch.no_grad():
                 dists = torch.cdist(
                     pool_embs_gpu[anchor_pos:anchor_pos + 1],
                     pool_embs_gpu[:active],
                 ).squeeze(0)                                   # (active,)
+            # Update stale entry with the fresh value
+            dists[anchor_pos] = float('inf')                   # exclude self
+            min_d_gpu[anchor_pos] = dists.min()
+            if float(min_d_gpu[anchor_pos].item()) >= margin:
+                return None                                    # epoch done
+            dists[anchor_pos] = 0.0                            # restore so topk includes anchor
             pos      = torch.topk(dists, CLUSTER_SIZE, largest=False).indices.cpu().tolist()
             lmdb_ids = [int(pool_idx_arr[p]) for p in pos]
             return lmdb_ids, pos
 
-        # Bootstrap: compute first cluster and start its fetch before the loop
-        cluster_lmdb, cluster_pos = _next_cluster()
+        # Bootstrap: find first cluster (may be None if margin already satisfied)
+        first_result = _next_cluster()
+        if first_result is None:
+            print("  All pairs already satisfy margin — skipping epoch.")
+            pbar.close()
+            continue
+        cluster_lmdb, cluster_pos = first_result
         prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
 
         # ── Step 4: consume pool ───────────────────────────────────────────────
@@ -247,13 +264,18 @@ def train():
                 last = active - 1
                 pool_embs_gpu[p] = pool_embs_gpu[last]
                 pool_idx_arr[p]  = pool_idx_arr[last]
+                min_d_gpu[p]     = min_d_gpu[last]   # carry over lower bound
                 active -= 1
 
-            # If pool is big enough, compute NEXT cluster and prefetch its images
+            # If pool is big enough, find NEXT cluster and prefetch its images
             # NOW — this runs in parallel with the GPU step below
             if active >= CLUSTER_SIZE:
-                cluster_lmdb, cluster_pos = _next_cluster()
-                prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+                next_result = _next_cluster()
+                if next_result is not None:
+                    cluster_lmdb, cluster_pos = next_result
+                    prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+                else:
+                    prefetch = None          # margin satisfied — stop after this step
             else:
                 prefetch = None
 
