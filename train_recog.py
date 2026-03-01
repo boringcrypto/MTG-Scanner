@@ -41,7 +41,7 @@ LR                = 3e-5
 EPOCHS            = 500
 EMBED_BATCH          = 1024    # images per no-grad forward pass
 IMG_WORKERS          = 16      # parallel image-decode threads
-FULL_REFRESH_EVERY   = 10      # full embed_all every N gradient steps
+REFRESH_STEPS        = 10      # partial re-embed rounds per epoch
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -208,11 +208,7 @@ def train():
         print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}"
               f"  closest=({epoch_indices[close_i]}, {epoch_indices[close_j]})")
 
-        # ── Step 3: persistent GPU pool (no removal) ────────────────────────
-        # pool_embs_gpu holds the latest embedding for every card.
-        # After each gradient step the trained 128 rows are patched back in-place
-        # for free (e is already computed).  A full embed_all corrects drift in
-        # the remaining N-128 rows every FULL_REFRESH_EVERY steps.
+        # ── Step 3: persistent GPU pool ────────────────────────────────────────
         pool_embs_gpu = torch.from_numpy(embs_np).to(device)   # (N, D)
         pool_idx_arr  = np.array(epoch_indices, dtype=np.int64) # (N,) – fixed
 
@@ -221,15 +217,12 @@ def train():
         total_pairs = 0
         n_batches   = 0
 
-        pbar = tqdm(desc=f"  Epoch {epoch}", unit="step")
-
         model.train()
 
         def _next_cluster():
             """
             Pick the anchor with the lowest stale NN distance (hardest pair),
-            verify its true NN distance, and return None if epoch is done.
-            Searches all N embeddings (no pool shrinking).
+            verify its true NN distance, and return None if this round is done.
             """
             anchor_pos = int(min_d_gpu.argmin().item())
             with torch.no_grad():
@@ -240,102 +233,111 @@ def train():
             dists[anchor_pos] = float('inf')                   # exclude self
             min_d_gpu[anchor_pos] = dists.min()
             if float(min_d_gpu[anchor_pos].item()) >= margin:
-                return None                                    # epoch done
+                return None                                    # round done
             dists[anchor_pos] = 0.0                            # restore so topk includes anchor
             pos      = torch.topk(dists, CLUSTER_SIZE, largest=False).indices.cpu().tolist()
             lmdb_ids = [int(pool_idx_arr[p]) for p in pos]
             return lmdb_ids, pos
 
-        # Bootstrap: find first cluster (may be None if margin already satisfied)
-        first_result = _next_cluster()
-        if first_result is None:
-            print("  All pairs already satisfy margin — skipping epoch.")
-            pbar.close()
-            continue
-        cluster_lmdb, cluster_pos = first_result
-        prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+        # ── Step 4: REFRESH_STEPS rounds ──────────────────────────────────────
+        for refresh_i in range(REFRESH_STEPS):
 
-        # ── Step 4: training loop ──────────────────────────────────────────────
-        while True:
-            imgs_np = prefetch.result()
+            first_result = _next_cluster()
+            if first_result is None:
+                print(f"  Converged after {refresh_i} refresh(es) — stopping epoch.")
+                break
 
-            # Should the NEXT step trigger a full refresh?
-            # Known in advance so we can skip submitting a prefetch on refresh steps.
-            will_refresh = (n_batches + 1) % FULL_REFRESH_EVERY == 0
+            cluster_lmdb, cluster_pos = first_result
+            prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+            touched_pos: set = set()
+            pbar = tqdm(desc=f"  Epoch {epoch} round {refresh_i + 1}/{REFRESH_STEPS}",
+                        unit="step")
 
-            if not will_refresh:
-                # Submit next prefetch NOW — runs parallel to GPU step below
+            # ── Inner loop: drain all violations in current embedding snapshot ─
+            while True:
+                imgs_np = prefetch.result()
+
+                # Submit next prefetch in parallel with GPU work
                 next_result = _next_cluster()
                 if next_result is not None:
                     cluster_lmdb_next, cluster_pos_next = next_result
-                    prefetch_next = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb_next)
-                else:
-                    # Stale embeddings say done — force a confirming refresh
-                    will_refresh = True
+                    prefetch_next = _executor.submit(_fetch_images, CARDS_224,
+                                                     cluster_lmdb_next)
 
-            # ── Forward pass with grad ─────────────────────────────────────────
-            x = torch.from_numpy(imgs_np).to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                e = model(x).float()
-            e = F.normalize(e, dim=1)                  # (K, D)
+                # ── Forward + backward ─────────────────────────────────────────
+                x = torch.from_numpy(imgs_np).to(device)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    e = model(x).float()
+                e = F.normalize(e, dim=1)                      # (K, D)
 
-            loss = repulsion_loss(e, margin)
-            if loss.item() > 0:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                loss = repulsion_loss(e, margin)
+                if loss.item() > 0:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-            # ── Patch pool embeddings + stats (e already computed — free) ──────
-            with torch.no_grad():
-                K             = e.size(0)
-                cluster_pos_t = torch.tensor(cluster_pos, dtype=torch.long, device=device)
-                e_det         = e.detach()
+                # ── Patch pool + update min_d + stats ─────────────────────────
+                with torch.no_grad():
+                    K             = e.size(0)
+                    cluster_pos_t = torch.tensor(cluster_pos, dtype=torch.long,
+                                                 device=device)
+                    e_det         = e.detach()
 
-                # Update the trained rows and their NN distances
-                pool_embs_gpu[cluster_pos_t] = e_det
-                sub_dists = torch.cdist(e_det, pool_embs_gpu)              # (K, N)
-                sub_dists[torch.arange(K, device=device), cluster_pos_t] = float('inf')
-                min_d_gpu[cluster_pos_t] = sub_dists.min(dim=1).values
+                    pool_embs_gpu[cluster_pos_t] = e_det
+                    sub_dists = torch.cdist(e_det, pool_embs_gpu)          # (K, N)
+                    sub_dists[torch.arange(K, device=device),
+                              cluster_pos_t] = float('inf')
+                    min_d_gpu[cluster_pos_t] = sub_dists.min(dim=1).values
 
-                # Intra-cluster stats
-                dm   = torch.cdist(e_det, e_det, p=2)
-                mask = torch.triu(torch.ones(K, K, device=device, dtype=torch.bool), diagonal=1)
-                pd   = dm[mask]
-                viol = int((pd < margin).sum().item())
-                np_  = int(pd.numel())
+                    dm   = torch.cdist(e_det, e_det, p=2)
+                    mask = torch.triu(torch.ones(K, K, device=device,
+                                                 dtype=torch.bool), diagonal=1)
+                    pd   = dm[mask]
+                    viol = int((pd < margin).sum().item())
+                    np_  = int(pd.numel())
 
-            total_loss  += loss.item()
-            total_viol  += viol
-            total_pairs += np_
-            n_batches   += 1
+                touched_pos.update(cluster_pos)
+                total_loss  += loss.item()
+                total_viol  += viol
+                total_pairs += np_
+                n_batches   += 1
 
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}",
-                             viol=f"{viol}/{np_}",
-                             min_d=f"{float(min_d_gpu.min().item()):.4f}")
+                pbar.update(1)
+                pbar.set_postfix(loss=f"{loss.item():.4f}",
+                                 viol=f"{viol}/{np_}",
+                                 min_d=f"{float(min_d_gpu.min().item()):.4f}")
 
-            if will_refresh:
-                # ── Full refresh ───────────────────────────────────────────────
-                model.eval()
-                embs_np = embed_all(model, CARDS_224, epoch_indices, device)
-                model.train()
-                pool_embs_gpu.copy_(torch.from_numpy(embs_np).to(device))
-                epoch_min, close_i, close_j, min_d_gpu = min_pairwise_dist(embs_np, device)
-                margin = epoch_min + MARGIN_SLACK
-                print(f"\n  [refresh step={n_batches}]  min_dist={epoch_min:.4f}"
-                      f"  margin={margin:.4f}"
-                      f"  closest=({epoch_indices[close_i]}, {epoch_indices[close_j]})")
-                next_result = _next_cluster()
                 if next_result is None:
-                    break  # epoch complete — all pairs satisfy margin
-                cluster_lmdb, cluster_pos = next_result
-                prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
-            else:
-                cluster_lmdb = cluster_lmdb_next
-                cluster_pos  = cluster_pos_next
-                prefetch     = prefetch_next
+                    break
+                cluster_lmdb, cluster_pos = cluster_lmdb_next, cluster_pos_next
+                prefetch = prefetch_next
 
-        pbar.close()
+            pbar.close()
+
+            # ── Partial re-embed: only cards trained this round ────────────────
+            touched_list     = sorted(touched_pos)
+            touched_lmdb_ids = [int(pool_idx_arr[p]) for p in touched_list]
+            print(f"  [round {refresh_i + 1}] re-embedding"
+                  f" {len(touched_list):,} touched cards…")
+            model.eval()
+            fresh_np = embed_all(model, CARDS_224, touched_lmdb_ids, device)
+            model.train()
+
+            touched_t = torch.tensor(touched_list, dtype=torch.long, device=device)
+            pool_embs_gpu[touched_t] = torch.from_numpy(fresh_np).to(device)
+
+            # Update min_d for re-embedded rows
+            with torch.no_grad():
+                T   = len(touched_t)
+                sub = torch.cdist(pool_embs_gpu[touched_t], pool_embs_gpu)  # (T, N)
+                sub[torch.arange(T, device=device), touched_t] = float('inf')
+                min_d_gpu[touched_t] = sub.min(dim=1).values
+
+            # Update margin to reflect current state
+            new_min = float(min_d_gpu.min().item())
+            margin  = new_min + MARGIN_SLACK
+            print(f"  [round {refresh_i + 1}] min_dist={new_min:.4f}"
+                  f"  margin={margin:.4f}")
 
         avg_loss  = total_loss  / max(n_batches, 1)
         viol_rate = total_viol  / max(total_pairs, 1)
