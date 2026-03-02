@@ -109,8 +109,9 @@ def _fetch_images(lmdb_path: str, indices: list, augment: bool = False) -> np.nd
 def embed_all(model: nn.Module, lmdb_path: str, indices: list,
               device: torch.device, augment: bool = False) -> np.ndarray:
     """
-    Embed every index in batches.
+    Embed every index in batches (no grad).
     Returns L2-normalised float32 array of shape (N, D).
+    Used for partial re-embeds during the inner loop.
 
     Prefetch: while the GPU processes batch N, batch N+1 is decoded in parallel.
     """
@@ -143,6 +144,65 @@ def embed_all(model: nn.Module, lmdb_path: str, indices: list,
     if was_training:
         model.train()
     return np.vstack(out)                               # (N, D)
+
+
+def embed_all_with_inv(
+        model: nn.Module, lmdb_path: str, indices: list,
+        device: torch.device, optimizer: torch.optim.Optimizer,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Combined augmented + clean forward pass with a per-batch invariance update.
+
+    For every batch:
+      1. Fetch augmented and clean images in parallel.
+      2. Forward augmented with grad; forward clean with no_grad (fixed target).
+      3. Invariance loss = MSE(aug_emb, clean_emb) — train aug to match clean.
+      4. Zero-grad → backward → step.
+      5. Accumulate both embedding arrays for pool / clean_targets.
+
+    Returns (aug_embs_np, clean_embs_np), each (N, D) float32.
+    """
+    model.train()
+    starts = list(range(0, len(indices), EMBED_BATCH))
+    if not starts:
+        empty = np.empty((0,), dtype=np.float32)
+        return empty, empty
+
+    def _submit_both(start):
+        batch = indices[start: start + EMBED_BATCH]
+        return (
+            _executor.submit(_fetch_images, lmdb_path, batch, True),
+            _executor.submit(_fetch_images, lmdb_path, batch, False),
+        )
+
+    aug_out   = []
+    clean_out = []
+    total_inv = 0.0
+    prefetch = _submit_both(starts[0])
+
+    for i, start in enumerate(tqdm(starts, desc="  inv-embed", leave=False)):
+        fut_aug, fut_clean = prefetch
+        if i + 1 < len(starts):
+            prefetch = _submit_both(starts[i + 1])
+
+        x_aug   = torch.from_numpy(fut_aug.result()).to(device)
+        x_clean = torch.from_numpy(fut_clean.result()).to(device)
+
+        e_aug = F.normalize(model(x_aug), dim=1)            # grad flows here
+        with torch.no_grad():
+            e_clean = F.normalize(model(x_clean), dim=1)   # fixed target
+
+        inv_loss = (e_aug - e_clean).pow(2).sum(dim=1).mean()
+        optimizer.zero_grad()
+        inv_loss.backward()
+        optimizer.step()
+        total_inv += inv_loss.item()
+
+        aug_out.append(e_aug.detach().cpu().numpy())
+        clean_out.append(e_clean.cpu().numpy())
+
+    print(f"  inv-embed avg_loss={total_inv / len(starts):.6f}")
+    return np.vstack(aug_out), np.vstack(clean_out)         # (N, D) each
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
@@ -246,9 +306,10 @@ def train():
         n = len(epoch_indices)
         print(f"\nEpoch {epoch}/{EPOCHS}  –  {n:,} canonical images")
 
-        # ── Step 2: embed with augmentation → pool; embed clean → invariance targets ──
-        embs_np  = embed_all(model, CARDS_224, epoch_indices, device, augment=True)  # (N, D)
-        clean_np = embed_all(model, CARDS_224, epoch_indices, device, augment=False) # (N, D)
+        # ── Step 2: combined inv-embed pass — augmented pool + clean targets + inv grad ──
+        embs_np, clean_np = embed_all_with_inv(
+            model, CARDS_224, epoch_indices, device, optimizer,
+        )
 
         # ── Step 2b: set margin = min pairwise dist + slack ───────────────────
         epoch_min, close_i, close_j, min_d_gpu = min_pairwise_dist(embs_np, device)
