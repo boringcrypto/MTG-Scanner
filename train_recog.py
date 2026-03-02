@@ -38,6 +38,7 @@ CANONICAL_INDEX   = "data/cards/canonical_index.json"
 CHECKPOINT_DIR    = "runs/recog"
 CLUSTER_SIZE      = 64        # anchor + 127 nearest neighbours
 MARGIN_SLACK      = 0.1        # added on top of current min pairwise distance
+LAMBDA_INV        = 0.1        # weight of invariance loss (aug → clean target)
 LR                = 3e-5
 EPOCHS            = 500
 EMBED_BATCH          = CLUSTER_SIZE    # images per no-grad forward pass
@@ -64,7 +65,7 @@ def _tls_env(path: str) -> lmdb.Environment:
 
 def _decode_one(args) -> np.ndarray:
     """Decode a single image; called from worker threads."""
-    lmdb_path, idx = args
+    lmdb_path, idx, augment = args
     env = _tls_env(lmdb_path)
     with env.begin(buffers=True) as txn:
         raw = bytes(txn.get(str(idx).encode()))
@@ -72,18 +73,22 @@ def _decode_one(args) -> np.ndarray:
     if bgr.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
         bgr = cv2.resize(bgr, (IMAGE_SIZE, IMAGE_SIZE))
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    if augment:
+        sigma = np.random.uniform(0.0, 1.0)
+        rgb = cv2.GaussianBlur(rgb, (3, 3), sigma)
+        rgb = np.clip(rgb + np.random.normal(0, 0.02, rgb.shape).astype(np.float32), 0.0, 1.0)
     return ((rgb - _MEAN) / _STD).transpose(2, 0, 1)  # (3, H, W)
 
 
 _executor = ThreadPoolExecutor(max_workers=IMG_WORKERS)
 
 
-def _fetch_images(lmdb_path: str, indices: list) -> np.ndarray:
+def _fetch_images(lmdb_path: str, indices: list, augment: bool = False) -> np.ndarray:
     """
     Load + preprocess images in parallel.
     Returns float32 (N, 3, H, W).
     """
-    args = [(lmdb_path, idx) for idx in indices]
+    args = [(lmdb_path, idx, augment) for idx in indices]
     return np.stack(list(_executor.map(_decode_one, args)))
 
 
@@ -91,21 +96,24 @@ def _fetch_images(lmdb_path: str, indices: list) -> np.ndarray:
 
 @torch.no_grad()
 def embed_all(model: nn.Module, lmdb_path: str, indices: list,
-              device: torch.device) -> np.ndarray:
+              device: torch.device, augment: bool = False) -> np.ndarray:
     """
     Embed every index in batches.
     Returns L2-normalised float32 array of shape (N, D).
 
     Prefetch: while the GPU processes batch N, batch N+1 is decoded in parallel.
     """
+    was_training = model.training
     model.eval()
     starts = list(range(0, len(indices), EMBED_BATCH))
     if not starts:
+        if was_training:
+            model.train()
         return np.empty((0,), dtype=np.float32)
 
     def _submit(start):
         batch = indices[start: start + EMBED_BATCH]
-        return _executor.submit(_fetch_images, lmdb_path, batch)
+        return _executor.submit(_fetch_images, lmdb_path, batch, augment)
 
     out = []
     prefetch = _submit(starts[0])
@@ -121,6 +129,8 @@ def embed_all(model: nn.Module, lmdb_path: str, indices: list,
         e = F.normalize(e, dim=1).cpu().numpy()
         out.append(e)
 
+    if was_training:
+        model.train()
     return np.vstack(out)                               # (N, D)
 
 
@@ -225,8 +235,9 @@ def train():
         n = len(epoch_indices)
         print(f"\nEpoch {epoch}/{EPOCHS}  –  {n:,} canonical images")
 
-        # ── Step 2: embed (no grad) ────────────────────────────────────────────
-        embs_np = embed_all(model, CARDS_224, epoch_indices, device)     # (N, D)
+        # ── Step 2: embed with augmentation → pool; embed clean → invariance targets ──
+        embs_np  = embed_all(model, CARDS_224, epoch_indices, device, augment=True)  # (N, D)
+        clean_np = embed_all(model, CARDS_224, epoch_indices, device, augment=False) # (N, D)
 
         # ── Step 2b: set margin = min pairwise dist + slack ───────────────────
         epoch_min, close_i, close_j, min_d_gpu = min_pairwise_dist(embs_np, device)
@@ -247,9 +258,11 @@ def train():
             json.dumps(report_data, indent=2)
         )
         print(f"  Report  → {report_stem}.txt / _report.json")
-        # ── Step 3: persistent GPU pool ────────────────────────────────────────
-        pool_embs_gpu = torch.from_numpy(embs_np).to(device)   # (N, D)
-        pool_idx_arr  = np.array(epoch_indices, dtype=np.int64) # (N,) – fixed
+        # ── Step 3: persistent GPU pool ────────────────────────────────────────────────
+        pool_embs_gpu     = torch.from_numpy(embs_np).to(device)    # (N, D) augmented
+        pool_idx_arr      = np.array(epoch_indices, dtype=np.int64)  # (N,) – fixed
+        # Clean embeddings frozen for the epoch — invariance targets, never mutated.
+        clean_targets_gpu = torch.from_numpy(clean_np).to(device)   # (N, D) clean
 
         total_loss  = 0.0
         total_viol  = 0
@@ -289,7 +302,7 @@ def train():
                 break
 
             cluster_lmdb, cluster_pos = first_result
-            prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb)
+            prefetch = _executor.submit(_fetch_images, CARDS_224, cluster_lmdb, True)
             touched_pos: set = set()
             pbar = tqdm(desc=f"  Epoch {epoch} round {refresh_i + 1}/{REFRESH_STEPS}",
                         unit="step")
@@ -303,7 +316,7 @@ def train():
                 if next_result is not None:
                     cluster_lmdb_next, cluster_pos_next = next_result
                     prefetch_next = _executor.submit(_fetch_images, CARDS_224,
-                                                     cluster_lmdb_next)
+                                                     cluster_lmdb_next, True)
 
                 # ── Forward + backward ─────────────────────────────────────────
                 x = torch.from_numpy(imgs_np).to(device)
@@ -335,7 +348,10 @@ def train():
                         print(f"  [DEBUG] min_d_gpu[close_i]: {min_d_gpu[close_i].item():.6f}")
                         print(f"  [DEBUG] margin={margin:.6f},  loss={repulsion_loss(e, margin).item():.6f}")
 
-                loss = repulsion_loss(e, margin)
+                cluster_pos_t = torch.tensor(cluster_pos, dtype=torch.long, device=device)
+                # Invariance: pull augmented embeddings toward frozen clean targets.
+                inv_loss = (e - clean_targets_gpu[cluster_pos_t]).pow(2).sum(dim=1).mean()
+                loss = repulsion_loss(e, margin) + LAMBDA_INV * inv_loss
                 if loss.item() > 0:
                     optimizer.zero_grad()
                     loss.backward()
@@ -343,10 +359,8 @@ def train():
 
                 # ── Patch pool + update min_d + stats ─────────────────────────
                 with torch.no_grad():
-                    K             = e.size(0)
-                    cluster_pos_t = torch.tensor(cluster_pos, dtype=torch.long,
-                                                 device=device)
-                    e_det         = e.detach()
+                    K     = e.size(0)
+                    e_det = e.detach()
 
                     pool_embs_gpu[cluster_pos_t] = e_det
                     _refresh_min_d(pool_embs_gpu, min_d_gpu, cluster_pos_t)
@@ -381,9 +395,7 @@ def train():
             touched_lmdb_ids = [int(pool_idx_arr[p]) for p in touched_list]
             print(f"  [round {refresh_i + 1}] re-embedding"
                   f" {len(touched_list):,} touched cards…")
-            model.eval()
-            fresh_np = embed_all(model, CARDS_224, touched_lmdb_ids, device)
-            model.train()
+            fresh_np = embed_all(model, CARDS_224, touched_lmdb_ids, device, augment=True)
 
             touched_t = torch.tensor(touched_list, dtype=torch.long, device=device)
             pool_embs_gpu[touched_t] = torch.from_numpy(fresh_np).to(device)
