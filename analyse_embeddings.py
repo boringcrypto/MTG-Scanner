@@ -397,6 +397,99 @@ def embedding_report(
     return buf.getvalue(), data
 
 
+def invariance_report(
+    card_dists: "np.ndarray",
+    batch_losses: "list[float]",
+    indices: list,
+    label: str = "",
+    worst_n: int = 20,
+    compare_base_url: str = "http://localhost:5000/#/compare",
+) -> "tuple[str, dict]":
+    """
+    Build a text + JSON report for the invariance (aug → clean) pass.
+
+    Parameters
+    ----------
+    card_dists   : (N,) float32 L2 distance between aug and clean embeddings
+    batch_losses : per-batch MSE loss values recorded during the pass
+    indices      : list of N lmdb IDs matching rows of card_dists
+    label        : optional header string
+    worst_n      : number of worst per-card entries to include
+
+    Returns
+    -------
+    (text, data) — same contract as embedding_report.
+    """
+    import io, contextlib
+
+    bl  = np.asarray(batch_losses, dtype=np.float32)
+    cd  = np.asarray(card_dists,   dtype=np.float32)
+    N   = len(cd)
+
+    pcts_cd  = np.percentile(cd, [25, 50, 75, 90, 95, 99]).tolist()
+    worst_pos = np.argsort(cd)[-worst_n:][::-1]
+    worst = [
+        {"rank": r + 1, "lmdb_id": int(indices[p]),
+         "dist": round(float(cd[p]), 6),
+         "url": f"{compare_base_url}?a={int(indices[p])}&b={int(indices[p])}"}
+        for r, p in enumerate(worst_pos)
+    ]
+
+    data = {
+        "label":    label,
+        "n_cards":  N,
+        "n_batches": len(bl),
+        "batch_loss": {
+            "min":  round(float(bl.min()),  6),
+            "mean": round(float(bl.mean()), 6),
+            "max":  round(float(bl.max()),  6),
+            "std":  round(float(bl.std()),  6),
+        },
+        "card_dist": {
+            "mean": round(float(cd.mean()), 6),
+            "std":  round(float(cd.std()),  6),
+            "min":  round(float(cd.min()),  6),
+            "p25":  round(pcts_cd[0], 6),
+            "p50":  round(pcts_cd[1], 6),
+            "p75":  round(pcts_cd[2], 6),
+            "p90":  round(pcts_cd[3], 6),
+            "p95":  round(pcts_cd[4], 6),
+            "p99":  round(pcts_cd[5], 6),
+            "max":  round(float(cd.max()),  6),
+        },
+        "worst_cards": worst,
+    }
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print(f"{'\u2550'*60}")
+        if label:
+            print(f"  {label}")
+        print(f"  Invariance pass  —  aug → clean L2 distance per card")
+        print(f"{'\u2550'*60}")
+        print(f"  Cards   : {N:,}     Batches : {len(bl)}")
+        print()
+        print(f"  Batch MSE loss")
+        print(f"    min={bl.min():.6f}  mean={bl.mean():.6f}"
+              f"  max={bl.max():.6f}  std={bl.std():.6f}")
+        print()
+        print(f"  Per-card L2(aug, clean)")
+        print(f"    mean={cd.mean():.6f}  std={cd.std():.6f}"
+              f"  min={cd.min():.6f}  max={cd.max():.6f}")
+        print(f"    p25={pcts_cd[0]:.6f}  p50={pcts_cd[1]:.6f}"
+              f"  p75={pcts_cd[2]:.6f}  p90={pcts_cd[3]:.6f}"
+              f"  p95={pcts_cd[4]:.6f}  p99={pcts_cd[5]:.6f}")
+        print()
+        print(f"  Worst {worst_n} cards by aug→clean distance:")
+        print(f"  {'rank':>4}  {'lmdb_id':>8}  {'dist':>10}")
+        print(f"  {'----':>4}  {'-------':>8}  {'----------':>10}")
+        for w in worst:
+            print(f"  {w['rank']:>4}  {w['lmdb_id']:>8}  {w['dist']:>10.6f}")
+        print(f"{'\u2500'*60}")
+
+    return buf.getvalue(), data
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():

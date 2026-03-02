@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 import timm
 from card_hasher import MODEL_NAME, IMAGE_SIZE, _MEAN, _STD
-from analyse_embeddings import embedding_report
+from analyse_embeddings import embedding_report, invariance_report
 from augmentations import (
     AugmentationPipeline, color_jitter, white_balance,
     add_noise, gaussian_blur, motion_blur,
@@ -175,9 +175,10 @@ def embed_all_with_inv(
             _executor.submit(_fetch_images, lmdb_path, batch, False),
         )
 
-    aug_out   = []
-    clean_out = []
-    total_inv = 0.0
+    aug_out    = []
+    clean_out  = []
+    batch_losses: list[float] = []
+    card_dists: list[np.ndarray] = []   # per-card L2(aug, clean) for every batch
     prefetch = _submit_both(starts[0])
 
     for i, start in enumerate(tqdm(starts, desc="  inv-embed", leave=False)):
@@ -192,17 +193,27 @@ def embed_all_with_inv(
         with torch.no_grad():
             e_clean = F.normalize(model(x_clean), dim=1)   # fixed target
 
-        inv_loss = (e_aug - e_clean).pow(2).sum(dim=1).mean()
+        diff      = e_aug - e_clean                         # (K, D)
+        per_card  = diff.pow(2).sum(dim=1)                  # (K,) squared L2
+        inv_loss  = per_card.mean()
         optimizer.zero_grad()
         inv_loss.backward()
         optimizer.step()
-        total_inv += inv_loss.item()
+
+        batch_losses.append(inv_loss.item())
+        card_dists.append(per_card.detach().sqrt().cpu().numpy())  # L2 distance
 
         aug_out.append(e_aug.detach().cpu().numpy())
         clean_out.append(e_clean.cpu().numpy())
 
-    print(f"  inv-embed avg_loss={total_inv / len(starts):.6f}")
-    return np.vstack(aug_out), np.vstack(clean_out)         # (N, D) each
+    all_dists = np.concatenate(card_dists)   # (N,)
+    all_aug   = np.vstack(aug_out)
+    all_clean = np.vstack(clean_out)
+    bl        = np.array(batch_losses)
+    p95       = float(np.percentile(all_dists, 95))
+    print(f"  inv-embed  loss avg={bl.mean():.6f}  "
+          f"dist mean={all_dists.mean():.4f}  p95={p95:.4f}  max={all_dists.max():.4f}")
+    return all_aug, all_clean, all_dists, batch_losses          # (N,D), (N,D), (N,), list
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
@@ -307,7 +318,7 @@ def train():
         print(f"\nEpoch {epoch}/{EPOCHS}  –  {n:,} canonical images")
 
         # ── Step 2: combined inv-embed pass — augmented pool + clean targets + inv grad ──
-        embs_np, clean_np = embed_all_with_inv(
+        embs_np, clean_np, inv_dists, inv_losses = embed_all_with_inv(
             model, CARDS_224, epoch_indices, device, optimizer,
         )
 
@@ -330,6 +341,17 @@ def train():
             json.dumps(report_data, indent=2)
         )
         print(f"  Report  → {report_stem}.txt / _report.json")
+        # ── Write invariance report ─────────────────────────────────────────────────────
+        inv_text, inv_data = invariance_report(
+            inv_dists, inv_losses, epoch_indices,
+            label=f"Epoch {report_epoch} invariance pass"
+                  f" — aug→clean distances  ({n:,} canonical images)",
+        )
+        report_stem.with_name(report_stem.name + "_inv.txt").write_text(inv_text)
+        report_stem.with_name(report_stem.name + "_inv_report.json").write_text(
+            json.dumps(inv_data, indent=2)
+        )
+        print(f"  Inv     → {report_stem}_inv.txt / _inv_report.json")
         # ── Step 3: persistent GPU pool ────────────────────────────────────────────────
         pool_embs_gpu     = torch.from_numpy(embs_np).to(device)    # (N, D) augmented
         pool_idx_arr      = np.array(epoch_indices, dtype=np.int64)  # (N,) – fixed
