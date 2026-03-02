@@ -116,9 +116,9 @@ def add_noise(img):
 
 # ── Blur ──────────────────────────────────────────────────────────────────────
 
-def gaussian_blur(img):
+def gaussian_blur(img, max_radius: int = 6):
     """Defocus blur — radius 0–6 px, small radii most common."""
-    r = _skewed(6)
+    r = _skewed(max_radius)
     if r < 0.5:
         return img
     k = int(r) * 2 + 1

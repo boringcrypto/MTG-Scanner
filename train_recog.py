@@ -15,6 +15,7 @@ Each epoch:
   5. Save checkpoint.  Repeat next epoch.
 """
 
+from functools import partial
 import json
 import lmdb
 import cv2
@@ -30,6 +31,18 @@ from tqdm import tqdm
 import timm
 from card_hasher import MODEL_NAME, IMAGE_SIZE, _MEAN, _STD
 from analyse_embeddings import embedding_report
+from augmentations import (
+    AugmentationPipeline, color_jitter, white_balance,
+    add_noise, gaussian_blur, motion_blur,
+)
+
+# ── Augmentation pipeline (applied on uint8 BGR before normalisation) ──────────
+_AUG_PIPELINE = AugmentationPipeline([
+    (color_jitter,  100),
+    (add_noise,     100),
+    (white_balance, 100),
+    (partial(gaussian_blur, max_radius=3), 100),
+])
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -72,11 +85,9 @@ def _decode_one(args) -> np.ndarray:
     bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
     if bgr.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
         bgr = cv2.resize(bgr, (IMAGE_SIZE, IMAGE_SIZE))
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     if augment:
-        sigma = np.random.uniform(0.0, 1.0)
-        rgb = cv2.GaussianBlur(rgb, (3, 3), sigma)
-        rgb = np.clip(rgb + np.random.normal(0, 0.02, rgb.shape).astype(np.float32), 0.0, 1.0)
+        bgr = _AUG_PIPELINE(bgr)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     return ((rgb - _MEAN) / _STD).transpose(2, 0, 1)  # (3, H, W)
 
 
