@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 import timm
 from card_hasher import MODEL_NAME, IMAGE_SIZE, _MEAN, _STD
+from analyse_embeddings import embedding_report
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -232,7 +233,20 @@ def train():
         margin = epoch_min + MARGIN_SLACK
         print(f"  min_dist={epoch_min:.4f}  margin={margin:.4f}"
               f"  closest=({epoch_indices[close_i]}, {epoch_indices[close_j]})")
-
+        # ── Write per-epoch embedding report (describes state after previous epoch) ──
+        report_epoch = epoch - 1
+        report_stem  = out_dir / f"epoch_{report_epoch:03d}"
+        report_text, report_data = embedding_report(
+            embs_np, epoch_indices, device,
+            nn_dists=min_d_gpu.cpu().numpy(),
+            label=f"Epoch {report_epoch} (state before epoch {epoch} training)  "
+                  f"– {n:,} canonical images",
+        )
+        report_stem.with_suffix(".txt").write_text(report_text)
+        report_stem.with_name(report_stem.name + "_report.json").write_text(
+            json.dumps(report_data, indent=2)
+        )
+        print(f"  Report  → {report_stem}.txt / _report.json")
         # ── Step 3: persistent GPU pool ────────────────────────────────────────
         pool_embs_gpu = torch.from_numpy(embs_np).to(device)   # (N, D)
         pool_idx_arr  = np.array(epoch_indices, dtype=np.int64) # (N,) – fixed

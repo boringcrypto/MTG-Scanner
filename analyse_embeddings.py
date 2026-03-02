@@ -267,6 +267,136 @@ def show_closest_pairs(db_path: str,
         plt.show()
 
 
+# ── Reusable text + JSON report (no plots, no re-embedding) ─────────────────
+
+def embedding_report(
+    embs: np.ndarray,
+    indices: list,
+    device: torch.device,
+    nn_dists: "np.ndarray | None" = None,
+    label: str = "",
+    top_pairs: int = 50,
+    compare_base_url: str = "http://localhost:5000/#/compare",
+) -> "tuple[str, dict]":
+    """
+    Build a text + JSON analysis report for pre-computed L2-normalised embeddings.
+
+    Parameters
+    ----------
+    embs             : (N, D) float32, already L2-normalised
+    indices          : list of N lmdb IDs matching rows of embs
+    device           : torch device for cdist operations
+    nn_dists         : (N,) nearest-neighbour distances; computed here if None
+    label            : optional header string (e.g. epoch identifier)
+    top_pairs        : number of deduplicated closest pairs to report
+    compare_base_url : base URL for the compare UI link
+
+    Returns
+    -------
+    (text, data) where text is the human-readable report and data is a dict
+    suitable for json.dumps().
+    """
+    import io, contextlib
+
+    if nn_dists is None:
+        nn_dists = nearest_neighbour_distances(embs, device)
+
+    N = len(embs)
+    norms = np.linalg.norm(embs, axis=1)
+    ps = np.percentile(nn_dists, [1, 5, 25, 50, 75, 95, 99]).tolist()
+    nn_cos = 1.0 - (nn_dists ** 2) / 2.0
+    ps_cos = np.percentile(nn_cos, [1, 5, 25, 50, 75, 95, 99]).tolist()
+
+    # ── Build pairs (deduplicated) ────────────────────────────────────────────
+    t = torch.from_numpy(embs).to(device)
+    seen: set = set()
+    pairs: list = []
+    for pos in np.argsort(nn_dists):
+        if len(pairs) >= top_pairs:
+            break
+        with torch.no_grad():
+            drow = torch.cdist(t[pos:pos + 1], t, p=2).squeeze(0)
+        drow[pos] = float("inf")
+        nn_pos = int(drow.argmin().item())
+        key = (min(pos, nn_pos), max(pos, nn_pos))
+        if key in seen:
+            continue
+        seen.add(key)
+        card_a = int(indices[pos])
+        card_b = int(indices[nn_pos])
+        dist   = float(nn_dists[pos])
+        url    = f"{compare_base_url}?a={card_a}&b={card_b}"
+        pairs.append({"rank": len(pairs) + 1, "card_a": card_a, "card_b": card_b,
+                      "dist": round(dist, 6), "url": url})
+
+    # ── Threshold table ───────────────────────────────────────────────────────
+    thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50,
+                  0.60, 0.70, 0.80, 1.00, 1.20, 1.40]
+    thresh_table = [
+        {"threshold": t, "count": int((nn_dists < t).sum()),
+         "fraction": round(float((nn_dists < t).mean()), 6)}
+        for t in thresholds
+    ]
+
+    # ── JSON data dict ────────────────────────────────────────────────────────
+    data = {
+        "label": label,
+        "n": N,
+        "embed_dim": int(embs.shape[1]),
+        "norm_min": round(float(norms.min()), 6),
+        "norm_max": round(float(norms.max()), 6),
+        "nn_dist": {
+            "min":    round(float(nn_dists.min()), 6),
+            "p1":     round(ps[0], 6),
+            "p5":     round(ps[1], 6),
+            "p25":    round(ps[2], 6),
+            "median": round(ps[3], 6),
+            "mean":   round(float(nn_dists.mean()), 6),
+            "std":    round(float(nn_dists.std()), 6),
+            "p75":    round(ps[4], 6),
+            "p95":    round(ps[5], 6),
+            "p99":    round(ps[6], 6),
+            "max":    round(float(nn_dists.max()), 6),
+        },
+        "nn_cosine": {
+            "min":    round(float(nn_cos.min()), 6),
+            "p1":     round(ps_cos[0], 6),
+            "median": round(ps_cos[3], 6),
+            "mean":   round(float(nn_cos.mean()), 6),
+            "max":    round(float(nn_cos.max()), 6),
+        },
+        "threshold_table": thresh_table,
+        "closest_pairs": pairs,
+    }
+
+    # ── Text report ───────────────────────────────────────────────────────────
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        if label:
+            print(f"{'═'*60}")
+            print(f"  {label}")
+            print(f"{'═'*60}")
+
+        print(f"  Embeddings : {embs.shape}  (L2-normalised unit vectors)")
+        print(f"  Embed dim  : {embs.shape[1]}")
+        print(f"  Norm range : {norms.min():.6f} – {norms.max():.6f}  (all should be ~1.0)")
+
+        print_stats("Nearest-Neighbour L2 distance  (lower = more clustered)", nn_dists)
+        text_histogram(nn_dists, title="NN distance distribution")
+        print_threshold_table(nn_dists)
+
+        print_stats("Nearest-Neighbour cosine similarity  (higher = more clustered)", nn_cos)
+
+        print(f"\n{'─'*60}")
+        print(f"  Top-{top_pairs} closest pairs  (deduplicated)")
+        print(f"{'─'*60}")
+        for p in pairs:
+            print(f"  #{p['rank']:2d}  card {p['card_a']:6d} ↔ card {p['card_b']:6d}"
+                  f"  d={p['dist']:.6f}  {p['url']}")
+
+    return buf.getvalue(), data
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
