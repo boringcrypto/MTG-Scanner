@@ -116,9 +116,9 @@ def add_noise(img):
 
 # ── Blur ──────────────────────────────────────────────────────────────────────
 
-def gaussian_blur(img, max_radius: int = 6):
-    """Defocus blur — radius 0–6 px, small radii most common."""
-    r = _skewed(max_radius)
+def gaussian_blur(img, max_r: float = 6):
+    """Defocus blur — radius 0–max_r px, small radii most common."""
+    r = _skewed(max_r)
     if r < 0.5:
         return img
     k = int(r) * 2 + 1
@@ -233,7 +233,7 @@ class AugmentationPipeline:
     def __call__(self, img: np.ndarray) -> np.ndarray:
         for fn, chance in self.augmentations:
             if random.random() * 100 <= chance:
-                with Timer(f"Augment: {fn.__name__}", logger=None):
+                with Timer(f"Augment: {getattr(fn, '__name__', None) or getattr(fn, 'func', fn).__name__}", logger=None):
                     img = fn(img)
         return img
 

@@ -41,7 +41,7 @@ _AUG_PIPELINE = AugmentationPipeline([
     (color_jitter,  100),
     (add_noise,     100),
     (white_balance, 100),
-    (partial(gaussian_blur, max_radius=3), 100),
+    (partial(gaussian_blur, max_r=3), 100),
 ])
 
 # ── Config ────────────────────────────────────────────────────────────────────
