@@ -10,6 +10,7 @@ Each epoch:
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from card_loader import AugmentedCard224Loader
 from card_model import CardEmbedder
@@ -63,11 +64,18 @@ class CardEmbeddingTrainer:
     def train(self):
         for epoch in range(1, EPOCHS + 1):
             self.model.train()
-            for _, x_aug, x_clean in self.loader.stream_with_original(BATCH_SIZE,
-                                                                       device=self.device):
+            total_loss, n_batches = 0.0, 0
+            pbar = tqdm(self.loader.stream_with_original(BATCH_SIZE, device=self.device),
+                        desc=f"epoch {epoch:4d}", leave=False)
+            for _, x_aug, x_clean in pbar:
                 e_aug   = self.model(x_aug)
                 e_clean = self.model(x_clean)
-                self._step(nt_xent_loss(e_aug, e_clean, TEMPERATURE))
+                loss    = nt_xent_loss(e_aug, e_clean, TEMPERATURE)
+                self._step(loss)
+                total_loss += loss.item()
+                n_batches  += 1
+                pbar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
+            print(f"epoch {epoch:4d}  loss {total_loss / n_batches:.4f}")
             self.model.save(epoch)
 
 
