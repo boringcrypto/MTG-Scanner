@@ -55,30 +55,32 @@ def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
 
 # ── Greedy batching ───────────────────────────────────────────────────────────
 
-def build_batches(embs: np.ndarray, batch_size: int) -> list[tuple[list[int], float]]:
+def build_batches(embs: np.ndarray, batch_size: int,
+                  device: torch.device) -> list[tuple[list[int], float]]:
     """
     Greedy nearest-neighbour batching over L2-normalised embeddings.
 
+    Uses dot-product similarity (= cosine sim for unit vectors) on GPU.
     Iterates in a random seed order so batch composition varies each epoch.
-    Returns a list of (position_indices, mean_dist_from_seed) sorted by
-    mean_dist ascending — tightest clusters first.
+    Returns a list of (position_indices, mean_sim_to_seed) sorted by
+    mean_sim descending — tightest clusters first.
     """
-    t          = torch.from_numpy(embs)              # CPU, (N, D)
-    unassigned = torch.ones(len(embs), dtype=torch.bool)
+    t          = torch.from_numpy(embs).to(device)          # (N, D)  GPU
+    unassigned = torch.ones(len(embs), dtype=torch.bool, device=device)
     batches: list[tuple[list[int], float]] = []
 
-    for seed in torch.randperm(len(embs)).tolist():
+    for seed in torch.randperm(len(embs), device=device).tolist():
         if not unassigned[seed]:
             continue
-        dists = torch.cdist(t[seed:seed + 1], t).squeeze(0)   # (N,)
-        dists[~unassigned] = float('inf')
+        sim = t @ t[seed]                                   # (N,)  dot product
+        sim[~unassigned] = -float('inf')
         k       = int(unassigned.sum().item())
-        nearest = torch.topk(dists, min(batch_size, k), largest=False).indices
-        mean_d  = dists[nearest].mean().item()
+        nearest = torch.topk(sim, min(batch_size, k), largest=True).indices
+        mean_s  = sim[nearest].mean().item()
         unassigned[nearest] = False
-        batches.append((nearest.tolist(), mean_d))
+        batches.append((nearest.tolist(), mean_s))
 
-    batches.sort(key=lambda b: b[1])
+    batches.sort(key=lambda b: b[1], reverse=True)         # highest sim first
     return batches
 
 
@@ -103,9 +105,10 @@ class CardEmbeddingTrainer:
     def _embed_all(self) -> np.ndarray:
         """Embed all cards (clean, no grad). Returns (N, D) float32 array."""
         self.model.eval()
-        out = []
+        out   = []
+        total = -(-len(self.indices) // EMBED_BATCH)   # ceil division
         for _, imgs_np in tqdm(self.clean_loader.stream(EMBED_BATCH, self.indices),
-                               desc="  embedding", leave=False):
+                               desc="  embedding", leave=False, total=total):
             out.append(self.model(torch.from_numpy(imgs_np).to(self.device)).cpu().numpy())
         self.model.train()
         return np.vstack(out)
@@ -113,7 +116,7 @@ class CardEmbeddingTrainer:
     def train(self):
         for epoch in range(1, EPOCHS + 1):
             embs    = self._embed_all()
-            batches = build_batches(embs, BATCH_SIZE)
+            batches = build_batches(embs, BATCH_SIZE, self.device)
             keep_n  = max(1, int(len(batches) * BATCH_KEEP))
             batches = batches[:keep_n]
 
