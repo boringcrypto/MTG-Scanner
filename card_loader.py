@@ -232,7 +232,7 @@ class CompositeAugCard224Loader:
         pts    = label.reshape(4, 2) * S                  # pixel coords (4, 2)
 
         # Jitter each corner by ±jitter × bbox-diagonal pixels
-        diag   = np.hypot(pts[:, 0].ptp(), pts[:, 1].ptp())
+        diag   = np.hypot(pts[:, 0].max() - pts[:, 0].min(), pts[:, 1].max() - pts[:, 1].min())
         pts    = np.clip(pts + np.random.uniform(-self._jitter, self._jitter, pts.shape) * diag,
                          0, S - 1).astype(np.float32)
 

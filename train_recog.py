@@ -28,7 +28,7 @@ TEMPERATURE = 0.07
 LR          = 3e-5
 EPOCHS      = 500
 # Swap to AugmentedCard224Loader for fast synthetic augmentation
-AUG_LOADER  = CompositeAugCard224Loader
+AUG_LOADER  = AugmentedCard224Loader
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
