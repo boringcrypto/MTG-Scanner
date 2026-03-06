@@ -103,10 +103,23 @@ class EmbeddingValidator:
         self._append_log(metrics)
         self._training_curve()
 
+        # ── Worst LMDB ids ───────────────────────────────────────────────────
+        worst_order = np.argsort(ranks_np)[::-1][:SHOW_WORST]
+        worst_rows  = [
+            (int(ranks_np[i]),
+             self.indices[val_pos[i]],
+             self.indices[retrieved_pos[i]])
+            for i in worst_order
+        ]
+
         self.model.train()
         print(f"  val   top1 {metrics['top1']:.1%}  top5 {metrics['top5']:.1%}  top10 {metrics['top10']:.1%}"
               f"  mean_rank {metrics['mean_rank']:.1f}  median_rank {metrics['median_rank']:.0f}"
               f"  cos_correct {metrics['cos_correct']:.4f}  cos_nn {metrics['cos_nn']:.4f}")
+        print(f"  worst {SHOW_WORST}:")
+        for rank, correct_id, retrieved_id in worst_rows:
+            url = f"http://localhost:5000/compare?a={correct_id}&b={retrieved_id}"
+            print(f"    rank {rank:>5}  correct={correct_id}  retrieved={retrieved_id}  {url}")
         return metrics
 
     # ── Retrieval sheet ──────────────────────────────────────────────────────

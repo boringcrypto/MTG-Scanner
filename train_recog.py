@@ -9,13 +9,14 @@ Each epoch:
   5. Save checkpoint.
 """
 
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from card_loader import Card224Loader, AugmentedCard224Loader
-from card_model import CardEmbedder
+from card_model import CardEmbedder, CHECKPOINT_DIR
 from val_recog import EmbeddingValidator
 
 
@@ -89,16 +90,29 @@ def build_batches(embs: np.ndarray, batch_size: int,
 
 class CardEmbeddingTrainer:
 
-    def __init__(self):
+    def __init__(self, resume: bool = False):
         self.device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.aug_loader   = AugmentedCard224Loader()
         self.clean_loader = Card224Loader()
-        self.model        = CardEmbedder().to(device=self.device, dtype=torch.float32)
+        self.model        = CardEmbedder.load("<latest>" if resume else None,
+                                              device=self.device).train()
         self.optimizer    = torch.optim.Adam(self.model.parameters(), lr=LR)
         self.indices      = self.aug_loader.all_indices    # list of lmdb ids
         self.validator    = EmbeddingValidator(
             self.aug_loader, self.clean_loader, self.model, self.indices, self.device
         )
+        self.start_epoch  = self._last_epoch() + 1 if resume else 1
+
+    @staticmethod
+    def _last_epoch() -> int:
+        """Return the epoch number of the highest epoch_NNN.pt in CHECKPOINT_DIR, or 0."""
+        pts = sorted(CHECKPOINT_DIR.glob("epoch_*.pt"))
+        if not pts:
+            return 0
+        try:
+            return int(pts[-1].stem.split("_")[1])
+        except (IndexError, ValueError):
+            return 0
 
     def _step(self, loss: torch.Tensor) -> None:
         self.optimizer.zero_grad()
@@ -118,7 +132,9 @@ class CardEmbeddingTrainer:
         return np.vstack(out)
 
     def train(self):
-        for epoch in range(1, EPOCHS + 1):
+        if self.start_epoch > 1:
+            print(f"Resuming from epoch {self.start_epoch}")
+        for epoch in range(self.start_epoch, self.start_epoch + EPOCHS):
             embs    = self._embed_all()
             m       = self.validator.validate(embs, epoch)
             batches = build_batches(embs, BATCH_SIZE, self.device)
@@ -144,4 +160,8 @@ class CardEmbeddingTrainer:
 
 
 if __name__ == "__main__":
-    CardEmbeddingTrainer().train()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume training from runs/recog/last.pt")
+    args = ap.parse_args()
+    CardEmbeddingTrainer(resume=args.resume).train()
