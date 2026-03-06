@@ -120,8 +120,14 @@ class CardEmbeddingTrainer:
         self.optimizer.step()
 
     @torch.no_grad()
-    def _embed_all(self) -> np.ndarray:
-        """Embed all cards (clean, no grad). Returns (N, D) float32 array."""
+    def _embed_all(self, model_epoch: int) -> np.ndarray:
+        """Embed all cards (clean, no grad). Returns (N, D) float32 array.
+        model_epoch: the epoch whose weights are currently loaded (epoch - 1 when called
+        at the top of the training loop); used to name the saved embedding file.
+        """
+        out_path = CHECKPOINT_DIR / f"embeddings_epoch_{model_epoch:03d}.npy"
+        if out_path.exists():
+            return np.load(out_path)
         self.model.eval()
         out   = []
         total = -(-len(self.indices) // EMBED_BATCH)   # ceil division
@@ -129,13 +135,15 @@ class CardEmbeddingTrainer:
                                desc="  embedding", leave=False, total=total):
             out.append(self.model(torch.from_numpy(imgs_np).to(self.device)).cpu().numpy())
         self.model.train()
-        return np.vstack(out)
+        embs = np.vstack(out)
+        np.save(out_path, embs)
+        return embs
 
     def train(self):
         if self.start_epoch > 1:
             print(f"Resuming from epoch {self.start_epoch}")
         for epoch in range(self.start_epoch, self.start_epoch + EPOCHS):
-            embs    = self._embed_all()
+            embs    = self._embed_all(model_epoch=epoch - 1)
             m       = self.validator.validate(embs, epoch)
             batches = build_batches(embs, BATCH_SIZE, self.device)
             keep_n  = max(1, int(len(batches) * BATCH_KEEP))

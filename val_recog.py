@@ -118,7 +118,7 @@ class EmbeddingValidator:
               f"  cos_correct {metrics['cos_correct']:.4f}  cos_nn {metrics['cos_nn']:.4f}")
         print(f"  worst {SHOW_WORST}:")
         for rank, correct_id, retrieved_id in worst_rows:
-            url = f"http://localhost:5000/compare?a={correct_id}&b={retrieved_id}"
+            url = f"http://localhost:5000/#/compare?a={correct_id}&b={retrieved_id}"
             print(f"    rank {rank:>5}  correct={correct_id}  retrieved={retrieved_id}  {url}")
         return metrics
 
