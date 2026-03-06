@@ -31,7 +31,7 @@ _BACKGROUNDS      = "backgrounds.lmdb"
 _CANONICAL_INDEX  = "data/cards/canonical_index.json"
 _IMG_WORKERS      = 16
 _COMPOSITE_SIZE   = 640    # make_sample output size
-_CORNER_JITTER    = 0.04   # ± fraction of card bbox diagonal to jitter each corner
+_CORNER_JITTER    = 0.013  # ± fraction of card bbox diagonal; biased outward
 
 # ── Standard augmentation pipeline ───────────────────────────────────────────
 
@@ -231,10 +231,15 @@ class CompositeAugCard224Loader:
         S      = _COMPOSITE_SIZE
         pts    = label.reshape(4, 2) * S                  # pixel coords (4, 2)
 
-        # Jitter each corner by ±jitter × bbox-diagonal pixels
-        diag   = np.hypot(pts[:, 0].max() - pts[:, 0].min(), pts[:, 1].max() - pts[:, 1].min())
-        pts    = np.clip(pts + np.random.uniform(-self._jitter, self._jitter, pts.shape) * diag,
-                         0, S - 1).astype(np.float32)
+        # Jitter each corner — biased outward from the card centroid so the crop
+        # mostly shows a little extra background rather than cutting into the card.
+        # Each corner moves along its outward unit vector by uniform(-jitter/4, jitter)*diag.
+        diag     = np.hypot(pts[:, 0].max() - pts[:, 0].min(), pts[:, 1].max() - pts[:, 1].min())
+        centroid = pts.mean(axis=0)
+        outward  = pts - centroid
+        outward  = outward / np.maximum(np.linalg.norm(outward, axis=1, keepdims=True), 1e-6)
+        bias     = np.random.uniform(-self._jitter / 4, self._jitter, (4, 1)) * diag
+        pts      = np.clip(pts + outward * bias, 0, S - 1).astype(np.float32)
 
         crop = warp_to_rect(composite, pts, 224, 224)
         rgb  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
