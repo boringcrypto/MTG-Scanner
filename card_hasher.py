@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import timm
 from pathlib import Path
+from card_model import MODEL_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,6 @@ from pathlib import Path
 
 HASH_BITS        = 384          # matches ViT-Small embed_dim exactly
 IMAGE_SIZE       = 224          # native ViT-Small pre-training resolution
-MODEL_NAME       = "vit_small_patch16_224"
 FINETUNED_WEIGHTS = "runs/recog/last.pt"  # loaded automatically if present
 
 # ImageNet normalisation constants (float32, channel-first friendly)

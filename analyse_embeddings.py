@@ -29,14 +29,13 @@ import cv2
 import numpy as np
 print("Importing pyorch")
 import torch
-print("Importing timm")
-import timm
 from pathlib import Path
 print("Importing tqdm")
 from tqdm import tqdm
 
 print("Importing card_hasher")
-from card_hasher import MODEL_NAME, IMAGE_SIZE, _MEAN, _STD
+from card_hasher import IMAGE_SIZE, _MEAN, _STD
+from card_model import CardEmbedder
 print("Imports done.")
 
 # ── Default paths ─────────────────────────────────────────────────────────────
@@ -46,22 +45,6 @@ EMBED_BATCH      = 256   # images per forward pass
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
-
-def load_model(weights: str | None, device: torch.device) -> torch.nn.Module:
-    model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=0)
-    if weights:
-        p = Path(weights)
-        if p.exists():
-            state = torch.load(str(p), map_location=device, weights_only=True)
-            model.load_state_dict(state)
-            print(f"Loaded fine-tuned weights: {p}")
-        else:
-            print(f"WARNING: weights file not found ({p}), using ImageNet pretrained.")
-    else:
-        print("Using ImageNet pretrained weights (no fine-tuning).")
-    model.eval()
-    model.to(device=device, dtype=torch.float32)
-    return model
 
 
 def embed_cards(model: torch.nn.Module, cards_224: str,
@@ -543,7 +526,7 @@ def main():
         print(f"Sampling    : all {len(sample_indices):,} canonical cards")
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = load_model(args.weights, device)
+    model = CardEmbedder.load(args.weights, device)
 
     # ── Embed ─────────────────────────────────────────────────────────────────
     embs = embed_cards(model, args.db, sample_indices, device)
