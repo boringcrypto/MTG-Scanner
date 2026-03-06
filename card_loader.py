@@ -19,8 +19,8 @@ from typing import Callable, Generator
 
 from card_hasher import _MEAN, _STD
 from augmentations import (
-    AugmentationPipeline, color_jitter, white_balance,
-    add_noise, gaussian_blur,
+    AugmentationPipeline, color_jitter, motion_blur, white_balance,
+    add_noise, gaussian_blur, shade, glare, foil,
 )
 
 _CARDS_224        = "data/cards/cards_224.lmdb"
@@ -34,6 +34,10 @@ RECOG_AUG_PIPELINE = AugmentationPipeline([
     (add_noise,                       100),
     (white_balance,                   100),
     (partial(gaussian_blur, max_r=3), 100),
+    (shade,                            50),
+    (glare,                            50),
+    (motion_blur,                      20),
+    (foil,                             10),
 ])
 
 

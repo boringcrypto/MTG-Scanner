@@ -16,13 +16,13 @@ from tqdm import tqdm
 
 from card_loader import Card224Loader, AugmentedCard224Loader
 from card_model import CardEmbedder
+from val_recog import EmbeddingValidator
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BATCH_SIZE  = 64
 BATCH_KEEP  = 0.70    # train on the tightest 70% of clusters each epoch
 EMBED_BATCH = 256     # larger batch size for no-grad embedding pass
-VAL_SIZE    = 1024    # augmented probes used for retrieval validation
 TEMPERATURE = 0.07
 LR          = 3e-5
 EPOCHS      = 500
@@ -96,52 +96,14 @@ class CardEmbeddingTrainer:
         self.model        = CardEmbedder().to(device=self.device, dtype=torch.float32)
         self.optimizer    = torch.optim.Adam(self.model.parameters(), lr=LR)
         self.indices      = self.aug_loader.all_indices    # list of lmdb ids
+        self.validator    = EmbeddingValidator(
+            self.aug_loader, self.clean_loader, self.model, self.indices, self.device
+        )
 
     def _step(self, loss: torch.Tensor) -> None:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-
-    @torch.no_grad()
-    def _validate(self, pool: np.ndarray) -> None:
-        """
-        Retrieval validation against the full clean embedding pool.
-
-        Samples VAL_SIZE augmented images, embeds them, then for each probe
-        finds its rank among all N clean embeddings (rank 1 = correct card is
-        the nearest neighbour).
-
-        Reports: top-1 / top-5 / top-10 accuracy, mean & median rank,
-                 mean cosine sim of correct pair (aug→clean), mean sim of NN.
-        """
-        self.model.eval()
-        N          = len(self.indices)
-        val_pos    = torch.randperm(N)[:VAL_SIZE].tolist()       # positions into self.indices
-        lmdb_ids   = [self.indices[p] for p in val_pos]
-        aug_np     = self.aug_loader.fetch(lmdb_ids)
-        aug_embs   = self.model(torch.from_numpy(aug_np).to(self.device))  # (V, D)
-
-        pool_gpu   = torch.from_numpy(pool).to(self.device)      # (N, D)
-        sim        = aug_embs @ pool_gpu.T                        # (V, N)  cosine sim
-
-        # rank of the correct match (1-based, lower = better)
-        correct_sim = sim[torch.arange(VAL_SIZE, device=self.device),
-                          torch.tensor(val_pos, device=self.device)]  # (V,)
-        ranks       = (sim >= correct_sim.unsqueeze(1)).sum(dim=1).float()  # (V,)
-
-        top1  = (ranks <= 1).float().mean().item()
-        top5  = (ranks <= 5).float().mean().item()
-        top10 = (ranks <= 10).float().mean().item()
-        mean_rank   = ranks.mean().item()
-        median_rank = ranks.median().item()
-
-        nn_sim      = sim.max(dim=1).values.mean().item()         # sim of nearest neighbour
-        correct_cos = correct_sim.mean().item()                   # sim of actual correct match
-
-        self.model.train()
-        print(f"  val   top1 {top1:.1%}  top5 {top5:.1%}  top10 {top10:.1%}"
-              f"  mean_rank {mean_rank:.1f}  median_rank {median_rank:.0f}"
-              f"  cos_correct {correct_cos:.4f}  cos_nn {nn_sim:.4f}")
 
     @torch.no_grad()
     def _embed_all(self) -> np.ndarray:
@@ -158,7 +120,7 @@ class CardEmbeddingTrainer:
     def train(self):
         for epoch in range(1, EPOCHS + 1):
             embs    = self._embed_all()
-            self._validate(embs)
+            m       = self.validator.validate(embs, epoch)
             batches = build_batches(embs, BATCH_SIZE, self.device)
             keep_n  = max(1, int(len(batches) * BATCH_KEEP))
             batches = batches[:keep_n]
