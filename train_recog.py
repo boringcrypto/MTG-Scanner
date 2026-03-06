@@ -16,7 +16,7 @@ from card_model import CardEmbedder
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BATCH_SIZE  = 256
+BATCH_SIZE  = 64
 TEMPERATURE = 0.07
 LR          = 3e-5
 EPOCHS      = 500
