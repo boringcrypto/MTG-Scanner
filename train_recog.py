@@ -36,24 +36,37 @@ AUG_LOADER  = CompositeAugCard224Loader
 def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
                  temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    NT-Xent (SimCLR) contrastive loss, decomposed into:
-      inv_loss : -sim(z_i, z_pos) / τ             (alignment — invariance to augmentation)
-      sep_loss : log Σ_{j≠i} exp(sim(z_i,z_j)/τ)  (separation — spread of negatives)
-      total    : inv_loss + sep_loss               (= cross_entropy)
+    Decoupled contrastive loss (Wang & Liu 2022), decomposed into:
+      inv_loss : -mean(sim(z_i, z_pos)) / τ           (pull positives together)
+      sep_loss : mean(log Σ_{j≠i,j≠pos} exp(sim/τ))   (push negatives apart)
+      total    : inv_loss + sep_loss
+
+    Unlike NT-Xent, the positive pair is excluded from the sep denominator,
+    so the two terms are independent and sep receives genuine gradient from
+    negatives even after positives have converged.
 
     aug_embs, clean_embs : (K, D)  L2-normalised
     """
-    K = aug_embs.size(0)
-    z = torch.cat([aug_embs, clean_embs], dim=0)    # (2K, D)
-    sim = torch.mm(z, z.T) / temperature             # (2K, 2K)  cosine × 1/τ
-    sim.fill_diagonal_(float('-inf'))                # exclude self-similarity
+    K    = aug_embs.size(0)
+    N    = 2 * K
+    z    = torch.cat([aug_embs, clean_embs], dim=0)    # (2K, D)
+    sim  = torch.mm(z, z.T) / temperature              # (2K, 2K)
+
+    rows   = torch.arange(N, device=z.device)
     labels = torch.cat([
-        torch.arange(K, 2 * K, device=z.device),    # aug_i   → clean_i
-        torch.arange(K,         device=z.device),    # clean_i → aug_i
+        torch.arange(K, N, device=z.device),           # aug_i   → clean_i
+        torch.arange(K,    device=z.device),            # clean_i → aug_i
     ])
-    pos_sim  = sim[torch.arange(2 * K, device=z.device), labels]  # (2K,)
+
+    pos_sim  = sim[rows, labels]                       # (2K,) before any masking
     inv_loss = -pos_sim.mean()
-    sep_loss = torch.logsumexp(sim, dim=1).mean()
+
+    # Exclude self AND positive from the separation denominator
+    sim_neg          = sim.clone()
+    sim_neg[rows, rows]   = float('-inf')              # self
+    sim_neg[rows, labels] = float('-inf')              # positive pair
+    sep_loss = torch.logsumexp(sim_neg, dim=1).mean()
+
     return inv_loss + sep_loss, inv_loss, sep_loss
 
 
