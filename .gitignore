@@ -41,3 +41,5 @@ Thumbs.db
 
 *.zip
 unified_card_database.db
+embeddings.npy
+recog.pt

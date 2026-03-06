@@ -155,9 +155,9 @@ async function runRecognize(blob) {
 function showResults(data) {
   resultsRow.innerHTML = "";
 
-  // Captured card (query)
+  // Captured card — shown at its true 224×224 (what the model actually saw)
   resultsRow.appendChild(makeTile(
-    "data:image/jpeg;base64," + data.card, "Captured card", "query-img", 130, 182
+    "data:image/jpeg;base64," + data.card, "Query (224×224)", "query-img", 224, 224
   ));
 
   // Top-5 matches

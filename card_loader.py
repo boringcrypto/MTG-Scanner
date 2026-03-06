@@ -22,10 +22,16 @@ from augmentations import (
     AugmentationPipeline, color_jitter, motion_blur, white_balance,
     add_noise, gaussian_blur, shade, glare, foil,
 )
+from datasets import CardDataset, BackgroundDataset
+from make_training_set import make_sample, warp_to_rect
 
 _CARDS_224        = "data/cards/cards_224.lmdb"
+_CARDS_FULL       = "data/cards/cards.lmdb"
+_BACKGROUNDS      = "backgrounds.lmdb"
 _CANONICAL_INDEX  = "data/cards/canonical_index.json"
 _IMG_WORKERS      = 16
+_COMPOSITE_SIZE   = 640    # make_sample output size
+_CORNER_JITTER    = 0.04   # ± fraction of card bbox diagonal to jitter each corner
 
 # ── Standard augmentation pipeline ───────────────────────────────────────────
 
@@ -184,6 +190,62 @@ class AugmentedCard224Loader(CardLoader):
 
     def _process_image(self, bgr: np.ndarray) -> np.ndarray:
         return self._pipeline(bgr)
+
+
+class CompositeAugCard224Loader:
+    """
+    Realistic augmentation loader: composites each card onto a random background
+    using the full make_sample pipeline (perspective warp, lighting, surface effects),
+    then cuts the card out using jittered corners and warps to 224×224.
+
+    Unlike AugmentedCard224Loader, this uses the full-resolution cards.lmdb source
+    (with alpha-blended rounded corners) rather than the pre-resized cards_224.lmdb,
+    producing realistic in-the-wild crops instead of synthetic colour jitter.
+    """
+
+    def __init__(self, jitter: float = _CORNER_JITTER):
+        self._cards_ds = CardDataset(lmdb_path=_CARDS_FULL)
+        self._bg_ds    = BackgroundDataset(lmdb_path=_BACKGROUNDS)
+        self._jitter   = jitter
+        self._mean     = _MEAN.reshape(1, 1, 3)
+        self._std      = _STD.reshape(1, 1, 3)
+        self._executor = ThreadPoolExecutor(max_workers=_IMG_WORKERS)
+        self._indices: list | None = None
+
+    @property
+    def all_indices(self) -> list:
+        if self._indices is None:
+            import json
+            self._indices = json.loads(open(_CANONICAL_INDEX).read())
+        return self._indices
+
+    def __len__(self) -> int:
+        return len(self.all_indices)
+
+    def _make_one(self, lmdb_id: int) -> np.ndarray:
+        """Composite one card and return a normalised (3, 224, 224) float32 array."""
+        card_bgra          = self._cards_ds[lmdb_id]
+        composite, label   = make_sample(card_bgra, self._bg_ds.random())
+
+        # label: float32 (8,) normalised TL TR BR BL corners in [0, 1]
+        S      = _COMPOSITE_SIZE
+        pts    = label.reshape(4, 2) * S                  # pixel coords (4, 2)
+
+        # Jitter each corner by ±jitter × bbox-diagonal pixels
+        diag   = np.hypot(pts[:, 0].ptp(), pts[:, 1].ptp())
+        pts    = np.clip(pts + np.random.uniform(-self._jitter, self._jitter, pts.shape) * diag,
+                         0, S - 1).astype(np.float32)
+
+        crop = warp_to_rect(composite, pts, 224, 224)
+        rgb  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        return ((rgb - self._mean) / self._std).transpose(2, 0, 1)
+
+    def fetch(self, indices: list) -> np.ndarray:
+        """Blocking fetch. Returns float32 (N, 3, 224, 224)."""
+        return np.stack(list(self._executor.map(self._make_one, indices)))
+
+    def fetch_async(self, indices: list):
+        return self._executor.submit(self.fetch, indices)
 
 
 if __name__ == "__main__":

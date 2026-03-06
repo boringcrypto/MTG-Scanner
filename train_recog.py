@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from card_loader import Card224Loader, AugmentedCard224Loader
+from card_loader import Card224Loader, AugmentedCard224Loader, CompositeAugCard224Loader
 from card_model import CardEmbedder, CHECKPOINT_DIR
 from val_recog import EmbeddingValidator
 
@@ -27,6 +27,8 @@ EMBED_BATCH = 256     # larger batch size for no-grad embedding pass
 TEMPERATURE = 0.07
 LR          = 3e-5
 EPOCHS      = 500
+# Swap to AugmentedCard224Loader for fast synthetic augmentation
+AUG_LOADER  = CompositeAugCard224Loader
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
@@ -53,6 +55,23 @@ def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
     inv_loss = -pos_sim.mean()
     sep_loss = torch.logsumexp(sim, dim=1).mean()
     return inv_loss + sep_loss, inv_loss, sep_loss
+
+
+# ── Embedding helper ─────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def embed_all(model: CardEmbedder, indices: list, device: torch.device,
+              batch_size: int = 256) -> np.ndarray:
+    """Embed all cards (clean images, no grad). Returns (N, D) float32 array."""
+    from card_loader import Card224Loader
+    loader = Card224Loader()
+    model.eval()
+    out   = []
+    total = -(-len(indices) // batch_size)
+    for _, imgs_np in tqdm(loader.stream(batch_size, indices),
+                           desc="  embedding", leave=False, total=total):
+        out.append(model(torch.from_numpy(imgs_np).to(device)).cpu().numpy())
+    return np.vstack(out)
 
 
 # ── Greedy batching ───────────────────────────────────────────────────────────
@@ -92,7 +111,7 @@ class CardEmbeddingTrainer:
 
     def __init__(self, resume: bool = False):
         self.device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.aug_loader   = AugmentedCard224Loader()
+        self.aug_loader   = AUG_LOADER()
         self.clean_loader = Card224Loader()
         self.model        = CardEmbedder.load("<latest>" if resume else None,
                                               device=self.device).train()
@@ -121,21 +140,12 @@ class CardEmbeddingTrainer:
 
     @torch.no_grad()
     def _embed_all(self, model_epoch: int) -> np.ndarray:
-        """Embed all cards (clean, no grad). Returns (N, D) float32 array.
-        model_epoch: the epoch whose weights are currently loaded (epoch - 1 when called
-        at the top of the training loop); used to name the saved embedding file.
-        """
+        """Embed all cards (clean, no grad); cache result to disk."""
         out_path = CHECKPOINT_DIR / f"embeddings_epoch_{model_epoch:03d}.npy"
         if out_path.exists():
             return np.load(out_path)
-        self.model.eval()
-        out   = []
-        total = -(-len(self.indices) // EMBED_BATCH)   # ceil division
-        for _, imgs_np in tqdm(self.clean_loader.stream(EMBED_BATCH, self.indices),
-                               desc="  embedding", leave=False, total=total):
-            out.append(self.model(torch.from_numpy(imgs_np).to(self.device)).cpu().numpy())
+        embs = embed_all(self.model, self.indices, self.device, EMBED_BATCH)
         self.model.train()
-        embs = np.vstack(out)
         np.save(out_path, embs)
         return embs
 
