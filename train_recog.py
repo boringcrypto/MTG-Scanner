@@ -10,6 +10,7 @@ Each epoch:
 """
 
 import argparse
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,12 +23,14 @@ from val_recog import EmbeddingValidator
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BATCH_SIZE  = 64
-BATCH_KEEP  = 0.70    # train on the tightest 70% of clusters each epoch
+BATCH_KEEP  = 0.25    # train on the tightest 25% of clusters each epoch
 EMBED_BATCH = 256     # larger batch size for no-grad embedding pass
-TEMPERATURE = 0.07
-MARGIN      = 0.05    # only repel negatives within this cosine distance of the positive
-LR          = 3e-5
-EPOCHS      = 500
+TEMPERATURE   = 0.07
+MARGIN        = 0.05    # only repel negatives within this cosine distance of the positive
+LR            = 3e-5
+LR_MIN        = LR * 0.01  # cosine decay floor
+WARMUP_EPOCHS = 10         # linearly ramp LR from LR/10 → LR over first N epochs
+EPOCHS        = 100
 # Swap to AugmentedCard224Loader for fast synthetic augmentation
 AUG_LOADER  = CompositeAugCard224Loader
 
@@ -136,11 +139,24 @@ class CardEmbeddingTrainer:
         self.model        = CardEmbedder.load("<latest>" if resume else None,
                                               device=self.device).train()
         self.optimizer    = torch.optim.Adam(self.model.parameters(), lr=LR)
+        self.start_epoch  = self._last_epoch() + 1 if resume else 1
+        self.scheduler    = self._make_scheduler()
         self.indices      = self.aug_loader.all_indices    # list of lmdb ids
         self.validator    = EmbeddingValidator(
             self.aug_loader, self.clean_loader, self.model, self.indices, self.device
         )
-        self.start_epoch  = self._last_epoch() + 1 if resume else 1
+
+    def _make_scheduler(self) -> torch.optim.lr_scheduler.LambdaLR:
+        """Warm-up then cosine decay. Fast-forwards to start_epoch when resuming."""
+        def lr_lambda(step: int) -> float:
+            if step < WARMUP_EPOCHS:
+                return (step + 1) / WARMUP_EPOCHS          # 0.1 → 1.0
+            progress = (step - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
+            return LR_MIN / LR + 0.5 * (1 - LR_MIN / LR) * (1 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        for _ in range(self.start_epoch - 1):             # fast-forward on resume
+            scheduler.step()
+        return scheduler
 
     @staticmethod
     def _last_epoch() -> int:
@@ -192,9 +208,12 @@ class CardEmbeddingTrainer:
                 pbar.set_postfix(loss=f"{total_loss/n:.3f}",
                                  inv=f"{inv_sum/n:.3f}",
                                  sep=f"{sep_sum/n:.3f}")
+            cur_lr = self.optimizer.param_groups[0]['lr']
             print(f"epoch {epoch:4d}  loss {total_loss/n:.4f}"
-                  f"  inv {inv_sum/n:.4f}  sep {sep_sum/n:.4f}")
+                  f"  inv {inv_sum/n:.4f}  sep {sep_sum/n:.4f}"
+                  f"  lr {cur_lr:.2e}")
             self.model.save(epoch)
+            self.scheduler.step()
 
 
 if __name__ == "__main__":
