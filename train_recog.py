@@ -153,8 +153,13 @@ class CardEmbeddingTrainer:
                 return (step + 1) / WARMUP_EPOCHS          # 0.1 → 1.0
             progress = (step - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
             return LR_MIN / LR + 0.5 * (1 - LR_MIN / LR) * (1 + math.cos(math.pi * progress))
+        last_epoch = self.start_epoch - 2  # -1 for fresh start, N-2 when resuming
+        if last_epoch >= 0:
+            # PyTorch requires initial_lr pre-set when last_epoch >= 0
+            for pg in self.optimizer.param_groups:
+                pg.setdefault("initial_lr", pg["lr"])
         return torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda, last_epoch=self.start_epoch - 2
+            self.optimizer, lr_lambda, last_epoch=last_epoch
         )
 
     @staticmethod
