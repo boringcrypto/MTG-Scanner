@@ -25,7 +25,7 @@ BATCH_SIZE  = 64
 BATCH_KEEP  = 0.70    # train on the tightest 70% of clusters each epoch
 EMBED_BATCH = 256     # larger batch size for no-grad embedding pass
 TEMPERATURE = 0.07
-MARGIN      = 0.2    # only repel negatives within this cosine distance of the positive
+MARGIN      = 0.05    # only repel negatives within this cosine distance of the positive
 LR          = 3e-5
 EPOCHS      = 500
 # Swap to AugmentedCard224Loader for fast synthetic augmentation
