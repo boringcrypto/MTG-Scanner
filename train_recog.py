@@ -70,7 +70,9 @@ def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
     threshold = (pos_sim - margin / temperature).unsqueeze(1)  # (2K, 1)
     sim_neg[sim_neg < threshold] = float('-inf')
 
-    sep_loss = torch.logsumexp(sim_neg, dim=1).mean()
+    sep_per_row = torch.logsumexp(sim_neg, dim=1)    # (2K,)  may be -inf where no semi-hard neg
+    active      = sep_per_row.isfinite()
+    sep_loss    = sep_per_row[active].mean() if active.any() else sim.new_tensor(0.0)
 
     return inv_loss + sep_loss, inv_loss, sep_loss
 
