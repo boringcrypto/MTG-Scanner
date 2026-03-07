@@ -153,10 +153,9 @@ class CardEmbeddingTrainer:
                 return (step + 1) / WARMUP_EPOCHS          # 0.1 → 1.0
             progress = (step - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
             return LR_MIN / LR + 0.5 * (1 - LR_MIN / LR) * (1 + math.cos(math.pi * progress))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-        for _ in range(self.start_epoch - 1):             # fast-forward on resume
-            scheduler.step()
-        return scheduler
+        return torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda, last_epoch=self.start_epoch - 2
+        )
 
     @staticmethod
     def _last_epoch() -> int:
