@@ -11,6 +11,7 @@ Each epoch:
 
 import argparse
 import math
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,11 @@ LR            = 3e-5
 LR_MIN        = LR * 0.01  # cosine decay floor
 WARMUP_EPOCHS = 10         # linearly ramp LR from LR/10 → LR over first N epochs
 EPOCHS        = 100
+# phash neighbor supervision
+PHASH_NEIGHBORS_PATH = Path("data/cards/phash_neighbors.npy")
+PHASH_SIM_LOW   = 0.50   # pull phash-NN pairs that are further apart than this
+PHASH_SIM_HIGH  = 0.75   # push phash-NN pairs that are closer than this
+PHASH_WEIGHT    = 0.5    # scale of phash band loss relative to main loss
 # Swap to AugmentedCard224Loader for fast synthetic augmentation
 AUG_LOADER  = CompositeAugCard224Loader
 
@@ -38,16 +44,17 @@ AUG_LOADER  = CompositeAugCard224Loader
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
-                 temperature: float, margin: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                 temperature: float, margin: float,
+                 phash_nn_mask: torch.Tensor | None = None,
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Decoupled contrastive loss with semi-hard negative masking.
+    Three-tier contrastive loss:
 
-      inv_loss : -mean(sim(z_i, z_pos)) / τ           (pull positives together)
-      sep_loss : mean(log Σ_{j: semi-hard} exp(sim/τ)) (push semi-hard negatives apart)
+      inv_loss   : aug/clean pull  (-mean sim of positive pairs)
+      sep_loss   : semi-hard repulsion of unrelated negatives (phash-NN excluded)
+      phash_loss : band loss on phash-NN pairs\n                   pull if sim < PHASH_SIM_LOW, push if sim > PHASH_SIM_HIGH
 
-    Semi-hard: negatives within `margin` cosine units of the positive.
-    Negatives already more than `margin` below the positive are masked out (-inf)
-    so they contribute no gradient, preventing over-repulsion of dissimilar cards.
+    phash_nn_mask : (K, K) bool tensor, True where cards i and j are phash-neighbors.
     """
     K    = aug_embs.size(0)
     N    = 2 * K
@@ -56,28 +63,42 @@ def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
 
     rows   = torch.arange(N, device=z.device)
     labels = torch.cat([
-        torch.arange(K, N, device=z.device),           # aug_i   → clean_i
-        torch.arange(K,    device=z.device),            # clean_i → aug_i
+        torch.arange(K, N, device=z.device),
+        torch.arange(K,    device=z.device),
     ])
 
-    pos_sim  = sim[rows, labels]                       # (2K,) temperature-scaled
+    pos_sim  = sim[rows, labels]
     inv_loss = -pos_sim.mean()
 
-    # Exclude self and positive pair
     sim_neg               = sim.clone()
     sim_neg[rows, rows]   = float('-inf')
     sim_neg[rows, labels] = float('-inf')
 
-    # Mask out negatives already more than `margin` below the positive
-    # threshold is in temperature-scaled space: (pos_sim - margin/τ)
-    threshold = (pos_sim - margin / temperature).unsqueeze(1)  # (2K, 1)
+    # Exclude phash-NN pairs from sep denominator so they are never pushed as hard negatives
+    if phash_nn_mask is not None:
+        sim_neg[phash_nn_mask.repeat(2, 2)] = float('-inf')
+
+    # Semi-hard masking: only repel negatives within margin of the positive
+    threshold = (pos_sim - margin / temperature).unsqueeze(1)
     sim_neg[sim_neg < threshold] = float('-inf')
 
-    sep_per_row = torch.logsumexp(sim_neg, dim=1)    # (2K,)  may be -inf where no semi-hard neg
+    sep_per_row = torch.logsumexp(sim_neg, dim=1)
     active      = sep_per_row.isfinite()
     sep_loss    = sep_per_row[active].mean() if active.any() else sim.new_tensor(0.0)
 
-    return inv_loss + sep_loss, inv_loss, sep_loss
+    # phash band loss on clean-clean similarity (temperature-UNscaled)
+    phash_loss = sim.new_tensor(0.0)
+    if phash_nn_mask is not None and phash_nn_mask.any():
+        sim_cc = torch.mm(clean_embs, clean_embs.T)   # (K, K) cosine sim, no temp
+        pull_mask = phash_nn_mask & (sim_cc < PHASH_SIM_LOW)
+        if pull_mask.any():
+            phash_loss = phash_loss - sim_cc[pull_mask].mean()
+        push_mask = phash_nn_mask & (sim_cc > PHASH_SIM_HIGH)
+        if push_mask.any():
+            phash_loss = phash_loss + sim_cc[push_mask].mean()
+
+    total = inv_loss + sep_loss + PHASH_WEIGHT * phash_loss
+    return total, inv_loss, sep_loss, phash_loss
 
 
 # ── Embedding helper ─────────────────────────────────────────────────────────
@@ -99,32 +120,47 @@ def embed_all(model: CardEmbedder, indices: list, device: torch.device,
 
 # ── Greedy batching ───────────────────────────────────────────────────────────
 
-def build_batches(embs: np.ndarray, batch_size: int,
-                  device: torch.device) -> list[tuple[list[int], float]]:
+def build_batches(embs: np.ndarray, batch_size: int, device: torch.device,
+                  phash_neighbors: dict | None = None,
+                  id_to_pos: dict | None = None,
+                  indices: list | None = None) -> list[tuple[list[int], float]]:
     """
-    Greedy nearest-neighbour batching over L2-normalised embeddings.
-
-    Uses dot-product similarity (= cosine sim for unit vectors) on GPU.
-    Iterates in a random seed order so batch composition varies each epoch.
-    Returns a list of (position_indices, mean_sim_to_seed) sorted by
-    mean_sim descending — tightest clusters first.
+    Greedy NN batching. If phash_neighbors is provided, the seed's phash-neighbors
+    are injected into the batch first (ensuring they always co-occur for band loss),
+    then remaining slots are filled with embedding-NN.
     """
-    t          = torch.from_numpy(embs).to(device)          # (N, D)  GPU
+    t          = torch.from_numpy(embs).to(device)
     unassigned = torch.ones(len(embs), dtype=torch.bool, device=device)
     batches: list[tuple[list[int], float]] = []
 
     for seed in torch.randperm(len(embs), device=device).tolist():
         if not unassigned[seed]:
             continue
-        sim = t @ t[seed]                                   # (N,)  dot product
+
+        # Inject phash-neighbors of this seed (if available and still unassigned)
+        reserved: list[int] = []
+        if phash_neighbors is not None and id_to_pos is not None and indices is not None:
+            seed_id  = indices[seed]
+            nb_ids   = phash_neighbors.get(seed_id, [])
+            for nb_id in nb_ids:
+                nb_pos = id_to_pos.get(int(nb_id))
+                if nb_pos is not None and unassigned[nb_pos]:
+                    reserved.append(nb_pos)
+                    if len(reserved) >= batch_size - 1:
+                        break
+
+        # Fill remaining slots with embedding-NN
+        sim = t @ t[seed]
         sim[~unassigned] = -float('inf')
+        for r in reserved:
+            sim[r] = float('inf')             # guarantee they're picked
         k       = int(unassigned.sum().item())
         nearest = torch.topk(sim, min(batch_size, k), largest=True).indices
-        mean_s  = sim[nearest].mean().item()
+        mean_s  = (t[nearest] @ t[seed]).mean().item()
         unassigned[nearest] = False
         batches.append((nearest.tolist(), mean_s))
 
-    batches.sort(key=lambda b: b[1], reverse=True)         # highest sim first
+    batches.sort(key=lambda b: b[1], reverse=True)
     return batches
 
 
@@ -142,6 +178,8 @@ class CardEmbeddingTrainer:
         self.start_epoch  = self._last_epoch() + 1 if resume else 1
         self.scheduler    = self._make_scheduler()
         self.indices      = self.aug_loader.all_indices    # list of lmdb ids
+        self.id_to_pos    = {lmdb_id: pos for pos, lmdb_id in enumerate(self.indices)}
+        self.phash_neighbors, self.phash_nb_sets = self._load_phash_neighbors()
         self.validator    = EmbeddingValidator(
             self.aug_loader, self.clean_loader, self.model, self.indices, self.device
         )
@@ -161,6 +199,29 @@ class CardEmbeddingTrainer:
         return torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda, last_epoch=last_epoch
         )
+
+    def _load_phash_neighbors(self) -> tuple[dict, dict]:
+        """Load phash neighbor map. Returns (neighbors_dict, neighbor_sets_dict)."""
+        if not PHASH_NEIGHBORS_PATH.exists():
+            print(f"[warn] {PHASH_NEIGHBORS_PATH} not found — phash supervision disabled.")
+            return {}, {}
+        raw = np.load(PHASH_NEIGHBORS_PATH, allow_pickle=True).item()
+        nb_sets = {k: set(int(x) for x in v) for k, v in raw.items()}
+        n_with_nb = sum(1 for v in nb_sets.values() if v)
+        print(f"[phash] loaded {len(raw):,} entries, {n_with_nb:,} with ≥1 neighbor")
+        return raw, nb_sets
+
+    def _build_phash_mask(self, lmdb_ids: list) -> torch.Tensor:
+        """Build (K, K) bool mask: True where cards i and j are phash-neighbors."""
+        K    = len(lmdb_ids)
+        mask = torch.zeros(K, K, dtype=torch.bool, device=self.device)
+        for i, lid_i in enumerate(lmdb_ids):
+            nb_set = self.phash_nb_sets.get(lid_i)
+            if nb_set:
+                for j, lid_j in enumerate(lmdb_ids):
+                    if i != j and lid_j in nb_set:
+                        mask[i, j] = True
+        return mask
 
     @staticmethod
     def _last_epoch() -> int:
@@ -195,27 +256,34 @@ class CardEmbeddingTrainer:
         for epoch in range(self.start_epoch, self.start_epoch + EPOCHS):
             embs    = self._embed_all(model_epoch=epoch - 1)
             m       = self.validator.validate(embs, epoch)
-            batches = build_batches(embs, BATCH_SIZE, self.device)
+            batches = build_batches(embs, BATCH_SIZE, self.device,
+                                    self.phash_neighbors, self.id_to_pos, self.indices)
             keep_n  = max(1, int(len(batches) * BATCH_KEEP))
             batches = batches[:keep_n]
 
             self.model.train()
-            total_loss, inv_sum, sep_sum, n = 0.0, 0.0, 0.0, 0
+            total_loss, inv_sum, sep_sum, ph_sum, n = 0.0, 0.0, 0.0, 0.0, 0
             pbar = tqdm(batches, desc=f"epoch {epoch:4d}", leave=False)
             for pos_list, _ in pbar:
-                lmdb_ids = [self.indices[p] for p in pos_list]
-                x_aug    = torch.from_numpy(self.aug_loader.fetch(lmdb_ids)).to(self.device)
-                x_clean  = torch.from_numpy(self.clean_loader.fetch(lmdb_ids)).to(self.device)
-                loss, inv, sep = nt_xent_loss(self.model(x_aug), self.model(x_clean), TEMPERATURE, MARGIN)
+                lmdb_ids      = [self.indices[p] for p in pos_list]
+                phash_mask    = self._build_phash_mask(lmdb_ids)
+                x_aug         = torch.from_numpy(self.aug_loader.fetch(lmdb_ids)).to(self.device)
+                x_clean       = torch.from_numpy(self.clean_loader.fetch(lmdb_ids)).to(self.device)
+                loss, inv, sep, ph = nt_xent_loss(
+                    self.model(x_aug), self.model(x_clean),
+                    TEMPERATURE, MARGIN, phash_mask
+                )
                 self._step(loss)
-                total_loss += loss.item(); inv_sum += inv.item(); sep_sum += sep.item(); n += 1
+                total_loss += loss.item(); inv_sum += inv.item()
+                sep_sum += sep.item(); ph_sum += ph.item(); n += 1
                 pbar.set_postfix(loss=f"{total_loss/n:.3f}",
                                  inv=f"{inv_sum/n:.3f}",
-                                 sep=f"{sep_sum/n:.3f}")
+                                 sep=f"{sep_sum/n:.3f}",
+                                 ph=f"{ph_sum/n:.3f}")
             cur_lr = self.optimizer.param_groups[0]['lr']
             print(f"epoch {epoch:4d}  loss {total_loss/n:.4f}"
                   f"  inv {inv_sum/n:.4f}  sep {sep_sum/n:.4f}"
-                  f"  lr {cur_lr:.2e}")
+                  f"  ph {ph_sum/n:.4f}  lr {cur_lr:.2e}")
             self.model.save(epoch)
             self.scheduler.step()
 
