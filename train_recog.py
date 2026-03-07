@@ -25,6 +25,7 @@ BATCH_SIZE  = 64
 BATCH_KEEP  = 0.70    # train on the tightest 70% of clusters each epoch
 EMBED_BATCH = 256     # larger batch size for no-grad embedding pass
 TEMPERATURE = 0.07
+MARGIN      = 0.2    # only repel negatives within this cosine distance of the positive
 LR          = 3e-5
 EPOCHS      = 500
 # Swap to AugmentedCard224Loader for fast synthetic augmentation
@@ -34,18 +35,16 @@ AUG_LOADER  = CompositeAugCard224Loader
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
-                 temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                 temperature: float, margin: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Decoupled contrastive loss (Wang & Liu 2022), decomposed into:
+    Decoupled contrastive loss with semi-hard negative masking.
+
       inv_loss : -mean(sim(z_i, z_pos)) / τ           (pull positives together)
-      sep_loss : mean(log Σ_{j≠i,j≠pos} exp(sim/τ))   (push negatives apart)
-      total    : inv_loss + sep_loss
+      sep_loss : mean(log Σ_{j: semi-hard} exp(sim/τ)) (push semi-hard negatives apart)
 
-    Unlike NT-Xent, the positive pair is excluded from the sep denominator,
-    so the two terms are independent and sep receives genuine gradient from
-    negatives even after positives have converged.
-
-    aug_embs, clean_embs : (K, D)  L2-normalised
+    Semi-hard: negatives within `margin` cosine units of the positive.
+    Negatives already more than `margin` below the positive are masked out (-inf)
+    so they contribute no gradient, preventing over-repulsion of dissimilar cards.
     """
     K    = aug_embs.size(0)
     N    = 2 * K
@@ -58,13 +57,19 @@ def nt_xent_loss(aug_embs: torch.Tensor, clean_embs: torch.Tensor,
         torch.arange(K,    device=z.device),            # clean_i → aug_i
     ])
 
-    pos_sim  = sim[rows, labels]                       # (2K,) before any masking
+    pos_sim  = sim[rows, labels]                       # (2K,) temperature-scaled
     inv_loss = -pos_sim.mean()
 
-    # Exclude self AND positive from the separation denominator
-    sim_neg          = sim.clone()
-    sim_neg[rows, rows]   = float('-inf')              # self
-    sim_neg[rows, labels] = float('-inf')              # positive pair
+    # Exclude self and positive pair
+    sim_neg               = sim.clone()
+    sim_neg[rows, rows]   = float('-inf')
+    sim_neg[rows, labels] = float('-inf')
+
+    # Mask out negatives already more than `margin` below the positive
+    # threshold is in temperature-scaled space: (pos_sim - margin/τ)
+    threshold = (pos_sim - margin / temperature).unsqueeze(1)  # (2K, 1)
+    sim_neg[sim_neg < threshold] = float('-inf')
+
     sep_loss = torch.logsumexp(sim_neg, dim=1).mean()
 
     return inv_loss + sep_loss, inv_loss, sep_loss
@@ -179,7 +184,7 @@ class CardEmbeddingTrainer:
                 lmdb_ids = [self.indices[p] for p in pos_list]
                 x_aug    = torch.from_numpy(self.aug_loader.fetch(lmdb_ids)).to(self.device)
                 x_clean  = torch.from_numpy(self.clean_loader.fetch(lmdb_ids)).to(self.device)
-                loss, inv, sep = nt_xent_loss(self.model(x_aug), self.model(x_clean), TEMPERATURE)
+                loss, inv, sep = nt_xent_loss(self.model(x_aug), self.model(x_clean), TEMPERATURE, MARGIN)
                 self._step(loss)
                 total_loss += loss.item(); inv_sum += inv.item(); sep_sum += sep.item(); n += 1
                 pbar.set_postfix(loss=f"{total_loss/n:.3f}",
